@@ -1,0 +1,51 @@
+# Operator Agent System Configuration
+
+# LLM 配置
+llm:
+  backend: "qwen"                # qwen / openai / anthropic / mock
+  model: "qwen3-235b-a22b"       # 阿里云 Qwen3 MoE 大模型
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  # api_key 从 .env 文件或环境变量 QWEN_API_KEY 读取
+  temperature: 0.1               # 代码生成用低温度
+  enable_thinking: false         # false=快速模式, true=深度思考(更准确但更慢)
+
+  # 多模型路由（可选）
+  routing:
+    enabled: false               # 是否启用多模型路由（默认关闭，向后兼容）
+    fast_model: "qwen-plus"      # 简单算子用快速模型
+    strong_model: "qwen3-235b-a22b"  # 复杂算子用强模型
+
+# 代码生成配置
+code_gen:
+  prefer_triton: false           # 是否优先使用Triton（跨平台）
+  fallback_to_triton: true       # 当原生后端失败时回退到Triton
+
+# 优化配置
+optimizer:
+  max_iterations: 3              # 最大优化迭代次数
+  target_efficiency: 0.75        # 目标带宽利用率
+  convergence_threshold: 0.02    # 收敛阈值（2%改善以下停止）
+
+# 验证配置
+verifier:
+  correctness_threshold: 1e-3    # 数值正确性阈值
+  min_bandwidth_efficiency: 0.50 # 最低带宽效率要求
+  run_actual_benchmark: false    # 是否实际在GPU上benchmark（需要GPU环境）
+
+# 工作流配置
+workflow:
+  max_retry_on_failure: 2        # 失败重试次数
+  parallel_codegen: true         # 是否并行为多个GPU类型生成代码
+  save_intermediate: true        # 是否保存中间产物
+
+# 输出配置
+output:
+  output_dir: "./output"         # 输出目录
+  save_kernels: true             # 是否保存生成的内核文件
+  save_report: true              # 是否保存验证报告
+  format: "json"                 # 输出格式 json / yaml
+
+# 日志配置
+logging:
+  level: "INFO"                  # DEBUG / INFO / WARNING / ERROR
+  file: "./logs/operator_agent.log"

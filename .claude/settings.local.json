@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip list:*)",
+      "Bash(pip install:*)",
+      "Bash(nvcc --version)",
+      "Bash(find /usr/local/cuda* -name nvcc)",
+      "Bash(python3 -c ':*)",
+      "Bash(python3 -c \" import json,sys data = json.load\\(sys.stdin\\) for r in data: if r['operator_name'] in ['flash_attention','matmul']: print\\(r['operator_name'], 'source_len:', len\\(r.get\\('source_code',''\\) or ''\\)\\) print\\(' notes:', r.get\\('notes'\\)\\) \")",
+      "Bash(ls -t output/hetero_results/phase1_*.json)",
+      "Bash(xargs python3:*)",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(r['operator_name'], 'compile=', r['compile_passed'], 'math=', r['math_correct'], 'err=', r['max_rel_error'], 'notes=', r['notes']\\) for r in data]\")",
+      "Bash(squeue -j 652)",
+      "Bash(scancel 652)",
+      "Bash(sbatch --partition=fnlp-4090 tests/hetero/run_phase1_slurm.sh)",
+      "Bash(squeue -u hywei)",
+      "Bash(scancel 653)",
+      "Bash(ls -lt logs/slurm-654.*)",
+      "Bash(curl -s --connect-timeout 5 https://dashscope.aliyuncs.com -o /dev/null -w \"%{http_code}\")",
+      "Bash(curl -s --connect-timeout 5 https://dashscope.aliyuncs.com)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(python test_qwen.py)",
+      "Bash(vpn)",
+      "Bash(env)",
+      "Bash(sbatch test_qwen_slurm.sh)",
+      "Bash(squeue -j 655)",
+      "Bash(sbatch tests/hetero/run_phase1_slurm.sh)",
+      "Bash(squeue -j 657)",
+      "Bash(ls -la logs/slurm-657.*)",
+      "Bash(squeue -j 658)",
+      "WebSearch",
+      "Bash(wc -l /remote-home1/hywei/operator_agent/agents/*.py)",
+      "Bash(python -c \"from prompts.code_gen_prompts import _get_cuda_forbidden; print\\(_get_cuda_forbidden\\(\\)[:300]\\)\")",
+      "Bash(squeue -j 741)",
+      "Bash(squeue -j 742)",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"from prompts.code_gen_prompts import build_cuda_codegen_prompt, _get_cuda_forbidden; print\\('OK:', len\\(_get_cuda_forbidden\\(\\)\\)\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('tests/hetero/hetero_test.py', doraise=True\\); print\\('Syntax OK'\\)\")"
+    ]
+  }
+}
