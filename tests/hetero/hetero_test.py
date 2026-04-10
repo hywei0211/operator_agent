@@ -478,17 +478,83 @@ class HeteroTester:
         op = op_name.lower()
 
         if op in ('gelu', 'silu', 'relu', 'sigmoid', 'tanh', 'softmax'):
-            launcher = _build_elementwise_launcher(target_fn, params)
+            launcher = HeteroTester._build_elementwise_launcher(target_fn, params)
         elif op == 'rmsnorm':
-            launcher = _build_rmsnorm_launcher(target_fn, params)
+            launcher = HeteroTester._build_rmsnorm_launcher(target_fn, params)
         elif op == 'matmul':
-            launcher = _build_matmul_launcher(target_fn, params)
+            launcher = HeteroTester._build_matmul_launcher(target_fn, params)
         elif op == 'flash_attention':
-            launcher = _build_attention_launcher(target_fn, params)
+            launcher = HeteroTester._build_attention_launcher(target_fn, params)
         else:
-            launcher = _build_elementwise_launcher(target_fn, params)
+            launcher = HeteroTester._build_elementwise_launcher(target_fn, params)
 
         return src + launcher
+
+    @staticmethod
+    def _build_elementwise_launcher(target_fn: str, params: list[str]) -> str:
+        """为逐元素算子生成 extern C launch_kernel wrapper"""
+        return f"""
+
+extern "C" void launch_kernel(const void* input, void* output, int N) {{
+    const half* in_ptr = reinterpret_cast<const half*>(input);
+    half* out_ptr = reinterpret_cast<half*>(output);
+    int block = 256;
+    int grid = (N + block - 1) / block;
+    {target_fn}<<<grid, block>>>(in_ptr, out_ptr, N);
+}}
+"""
+
+    @staticmethod
+    def _build_rmsnorm_launcher(target_fn: str, params: list[str]) -> str:
+        """为 RMSNorm 生成 launcher（推导 rows/cols）"""
+        return f"""
+
+extern "C" void launch_kernel(const void* input, void* output, int N) {{
+    const half* in_ptr = reinterpret_cast<const half*>(input);
+    half* out_ptr = reinterpret_cast<half*>(output);
+    // 假设最后一维是 hidden_size，用 4096 作为默认值
+    int cols = 4096;
+    int rows = N / cols;
+    if (rows < 1) rows = 1;
+    int block = 256;
+    int grid = rows;
+    {target_fn}<<<grid, block>>>(in_ptr, out_ptr, rows, cols);
+}}
+"""
+
+    @staticmethod
+    def _build_matmul_launcher(target_fn: str, params: list[str]) -> str:
+        """为矩阵乘法生成 launcher"""
+        return f"""
+
+extern "C" void launch_kernel(const void* input, void* output, int N) {{
+    const half* A = reinterpret_cast<const half*>(input);
+    half* C = reinterpret_cast<half*>(output);
+    // 简化: 假设方阵 M=K=sqrt(N)
+    int M = 512;
+    int K = 512;
+    int NN = 512;
+    dim3 block(16, 16);
+    dim3 grid((NN + 15) / 16, (M + 15) / 16);
+    {target_fn}<<<grid, block>>>(A, A, C, M, NN, K);
+}}
+"""
+
+    @staticmethod
+    def _build_attention_launcher(target_fn: str, params: list[str]) -> str:
+        """为 FlashAttention 生成 launcher"""
+        return f"""
+
+extern "C" void launch_kernel(const void* input, void* output, int N) {{
+    // FlashAttention: input = QKV packed, output = O
+    const half* qkv = reinterpret_cast<const half*>(input);
+    half* out = reinterpret_cast<half*>(output);
+    int batch = 4, seq_len = 512, head_dim = 64;
+    int block = 256;
+    int grid = batch;
+    {target_fn}<<<grid, block>>>(qkv, qkv, qkv, out, batch, seq_len, head_dim);
+}}
+"""
 
     def _gen_cuda_test_script(self, op_name: str, kernel) -> str:
         """生成独立的 CUDA 数值验证 Python 脚本"""

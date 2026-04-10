@@ -48,19 +48,31 @@ def build_agent_system(config: dict) -> OrchestratorAgent:
     llm_cfg = config.get("llm", {})
     llm_backend = llm_cfg.get("backend", "mock")
 
-    # 如有API key则使用真实LLM，否则降级为Mock
-    if llm_backend == "openai" and not (llm_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY")):
-        logging.warning("No OpenAI API key found, using mock LLM client")
-        llm_backend = "mock"
-    elif llm_backend == "anthropic" and not (llm_cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY")):
-        logging.warning("No Anthropic API key found, using mock LLM client")
+    # API key 检查：各后端对应的环境变量
+    _key_env_map = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "qwen": "QWEN_API_KEY",
+    }
+    env_var = _key_env_map.get(llm_backend)
+    if env_var and not (llm_cfg.get("api_key") or os.environ.get(env_var)):
+        logging.warning(f"No {env_var} found for backend '{llm_backend}', falling back to mock LLM client")
         llm_backend = "mock"
 
-    llm_client = create_llm_client(
-        backend=llm_backend,
-        model=llm_cfg.get("model", "gpt-4o"),
-    )
-    logging.info(f"Using LLM backend: {llm_backend}")
+    # 从 config.yaml 读取所有 LLM 参数传给客户端
+    llm_kwargs = {}
+    if llm_cfg.get("model"):
+        llm_kwargs["model"] = llm_cfg["model"]
+    if llm_cfg.get("base_url"):
+        llm_kwargs["base_url"] = llm_cfg["base_url"]
+    if llm_cfg.get("api_key"):
+        llm_kwargs["api_key"] = llm_cfg["api_key"]
+    if "enable_thinking" in llm_cfg:
+        llm_kwargs["enable_thinking"] = llm_cfg["enable_thinking"]
+
+    llm_client = create_llm_client(backend=llm_backend, **llm_kwargs)
+    logging.info(f"Using LLM backend: {llm_backend}"
+                 f" (model={llm_kwargs.get('model', 'default')})")
 
     # 创建Orchestrator
     orchestrator_cfg = {

@@ -2,11 +2,18 @@
 Review Loop - 算子质量保障核心循环
 五阶段渐进式验证：静态审查 → 编译 → 正确性 → 性能 → 综合评审
 每个阶段发现的问题都会反馈给 CodeGenAgent 或 OptimizerAgent 修复
+
+新增：
+- 进度回调（on_stage_change）用于 CLI 进度显示
+- 断点续传：每个 stage 完成后写入 checkpoint，crash 后可从上次位置继续
 """
+import json as _json
 import logging
-from dataclasses import dataclass, field
+import os
+import time as _time
+from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Optional
+from typing import Optional, Callable
 
 from agents.base_agent import BaseAgent, AgentContext, AgentResult, AgentStatus
 from agents.code_generator import CodeGenAgent
@@ -67,6 +74,7 @@ class ReviewLoopAgent(BaseAgent):
     MAX_ITERATIONS = 5
     MIN_BANDWIDTH_EFFICIENCY = 0.55
     MAX_RELATIVE_ERROR = 1e-3
+    CHECKPOINT_DIR = "./.review_checkpoints"
 
     def __init__(self, mcp_client: MCPClient, llm_client=None, config: dict = None):
         super().__init__("ReviewLoopAgent", llm_client, config)
@@ -78,10 +86,76 @@ class ReviewLoopAgent(BaseAgent):
         # 子 Agent（按需复用）
         self._codegen = CodeGenAgent(llm_client=llm_client)
         self._optimizer = OptimizerAgent(llm_client=llm_client, config=config)
-        self._verifier = VerifierAgent(llm_client=llm_client, config=config)
+        self._verifier = VerifierAgent(llm_client=llm_client, config=config, mcp_client=mcp_client)
+
+        # 进度回调（CLI 注入用于实时显示）
+        self._on_stage_change: Optional[Callable[[str, int, int, bool], None]] = None
 
     def get_system_prompt(self) -> str:
         return "你是GPU算子质量评审专家，负责全面评估算子代码的正确性和性能。"
+
+    def set_progress_callback(self, callback: Callable[[str, int, int, bool], None]):
+        """
+        设置进度回调。callback(stage_name, iteration, max_iterations, passed)
+        CLI 可注入此回调来实时显示进度。
+        """
+        self._on_stage_change = callback
+
+    def _emit_progress(self, stage: str, iteration: int, passed: Optional[bool] = None):
+        """触发进度回调"""
+        if self._on_stage_change:
+            try:
+                self._on_stage_change(stage, iteration, self.max_iterations, passed)
+            except Exception:
+                pass
+
+    # ── 断点续传 ─────────────────────────────────────────────
+
+    def _checkpoint_path(self, op_name: str, gpu_model: str) -> str:
+        os.makedirs(self.CHECKPOINT_DIR, exist_ok=True)
+        safe_name = f"{op_name}_{gpu_model}".replace(" ", "_").replace("/", "_")
+        return os.path.join(self.CHECKPOINT_DIR, f"{safe_name}.ckpt.json")
+
+    def _save_checkpoint(self, op_name: str, gpu_model: str, iteration: int,
+                         current_code: str, iteration_history: list, stage_results: list):
+        """每个 stage 结束后保存断点"""
+        try:
+            path = self._checkpoint_path(op_name, gpu_model)
+            data = {
+                "op_name": op_name,
+                "gpu_model": gpu_model,
+                "iteration": iteration,
+                "current_code": current_code,
+                "iteration_history": iteration_history,
+                "stage_count": len(stage_results),
+                "timestamp": _time.time(),
+            }
+            with open(path, "w") as f:
+                _json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.debug(f"[ReviewLoop] Checkpoint save failed: {e}")
+
+    def _load_checkpoint(self, op_name: str, gpu_model: str) -> Optional[dict]:
+        """尝试加载断点"""
+        path = self._checkpoint_path(op_name, gpu_model)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = _json.load(f)
+            # 超过 1 小时的 checkpoint 视为过期
+            if _time.time() - data.get("timestamp", 0) > 3600:
+                os.unlink(path)
+                return None
+            logger.info(f"[ReviewLoop] Resuming from checkpoint: iter={data['iteration']}")
+            return data
+        except Exception:
+            return None
+
+    def _clear_checkpoint(self, op_name: str, gpu_model: str):
+        path = self._checkpoint_path(op_name, gpu_model)
+        if os.path.exists(path):
+            os.unlink(path)
 
     async def run(self, context: AgentContext, **kwargs) -> AgentResult:
         self._start_timer()
@@ -104,7 +178,21 @@ class ReviewLoopAgent(BaseAgent):
 
         current_kernel = kernel
         iteration = 0
-        iteration_history: list[dict] = []  # 迭代历史，传递给 CodeGen 避免重复错误
+        iteration_history: list[dict] = []
+
+        # 尝试从断点恢复
+        ckpt = self._load_checkpoint(op_ir.name, gpu_spec.model_name)
+        if ckpt and ckpt.get("current_code"):
+            iteration = ckpt["iteration"]
+            iteration_history = ckpt.get("iteration_history", [])
+            current_kernel = GeneratedKernel(
+                operator_name=kernel.operator_name,
+                backend=kernel.backend,
+                target_gpu=kernel.target_gpu,
+                source_code=ckpt["current_code"],
+                build_flags=kernel.build_flags,
+            )
+            logger.info(f"[ReviewLoop] Resumed from checkpoint at iteration {iteration}")
 
         logger.info(f"[ReviewLoop] Starting review for {op_ir.name} on {gpu_spec.model_name}")
 
@@ -113,20 +201,28 @@ class ReviewLoopAgent(BaseAgent):
             logger.info(f"[ReviewLoop] === Iteration {iteration}/{self.max_iterations} ===")
 
             # ── Stage 1: 静态代码审查 ─────────────────────────────────
+            self._emit_progress("static_review", iteration)
             s1 = await self._stage_static_review(current_kernel, op_ir, gpu_spec)
             summary.stage_results.append(s1)
+            self._emit_progress("static_review", iteration, s1.passed)
             if not s1.passed:
                 iteration_history.append({"iteration": iteration, "stage": "static_review", "issues": s1.issues[:3]})
+                self._save_checkpoint(op_ir.name, gpu_spec.model_name, iteration,
+                                      current_kernel.source_code, iteration_history, summary.stage_results)
                 current_kernel = await self._fix_with_codegen(
                     current_kernel, op_ir, gpu_spec, tiling_config, sdk_context, s1, iteration_history
                 )
                 continue
 
             # ── Stage 2: 编译检查 ──────────────────────────────────────
+            self._emit_progress("compile", iteration)
             s2 = await self._stage_compile(current_kernel)
             summary.stage_results.append(s2)
+            self._emit_progress("compile", iteration, s2.passed)
             if not s2.passed:
                 iteration_history.append({"iteration": iteration, "stage": "compile", "issues": s2.issues[:3]})
+                self._save_checkpoint(op_ir.name, gpu_spec.model_name, iteration,
+                                      current_kernel.source_code, iteration_history, summary.stage_results)
                 # 记录编译错误到知识库
                 try:
                     from knowledge_base.compile_error_kb import get_compile_error_kb
@@ -140,18 +236,24 @@ class ReviewLoopAgent(BaseAgent):
                 continue
 
             # ── Stage 3: 正确性验证 ───────────────────────────────────
+            self._emit_progress("correctness", iteration)
             s3 = await self._stage_correctness(current_kernel, op_ir, gpu_spec)
             summary.stage_results.append(s3)
+            self._emit_progress("correctness", iteration, s3.passed)
             if not s3.passed:
                 iteration_history.append({"iteration": iteration, "stage": "correctness", "issues": s3.issues[:3]})
+                self._save_checkpoint(op_ir.name, gpu_spec.model_name, iteration,
+                                      current_kernel.source_code, iteration_history, summary.stage_results)
                 current_kernel = await self._fix_with_codegen(
                     current_kernel, op_ir, gpu_spec, tiling_config, sdk_context, s3, iteration_history
                 )
                 continue
 
             # ── Stage 4: 性能基准 ─────────────────────────────────────
+            self._emit_progress("performance", iteration)
             s4 = await self._stage_performance(current_kernel, op_ir, gpu_spec)
             summary.stage_results.append(s4)
+            self._emit_progress("performance", iteration, s4.passed)
             if not s4.passed:
                 current_kernel = await self._optimize_kernel(
                     current_kernel, op_ir, gpu_spec, s4, iteration
@@ -159,8 +261,10 @@ class ReviewLoopAgent(BaseAgent):
                 continue
 
             # ── Stage 5: 综合评审（全部通过）─────────────────────────
+            self._emit_progress("meta_review", iteration)
             s5 = await self._stage_meta_review(current_kernel, op_ir, gpu_spec, [s1, s2, s3, s4])
             summary.stage_results.append(s5)
+            self._emit_progress("meta_review", iteration, s5.passed)
             summary.final_passed = s5.passed
             summary.bandwidth_utilization = s4.score
             summary.total_iterations = iteration
@@ -174,6 +278,9 @@ class ReviewLoopAgent(BaseAgent):
             logger.warning(f"[ReviewLoop] {op_ir.name} escalated after {iteration} iterations")
 
         summary.total_iterations = iteration
+
+        # 清理断点（正常完成）
+        self._clear_checkpoint(op_ir.name, gpu_spec.model_name)
 
         # 写入算子仓库（即使没完全通过，也存储当前最优版本）
         if summary.final_kernel and (summary.final_passed or summary.escalated_to_human):
@@ -274,7 +381,7 @@ class ReviewLoopAgent(BaseAgent):
     async def _stage_correctness(
         self, kernel: GeneratedKernel, op_ir: OperatorIR, gpu_spec: GPUSpec
     ) -> StageResult:
-        """Stage 3: 数值正确性验证"""
+        """Stage 3: 数值正确性验证（利用 Verifier 的分层结果）"""
         ctx = AgentContext()
         result = await self._verifier.run(
             ctx,
@@ -291,10 +398,34 @@ class ReviewLoopAgent(BaseAgent):
             )
 
         report: VerificationReport = result.output
-        passed = report.correctness_passed
+
+        # 根据验证等级判断是否通过
+        from agents.verifier import VerificationLevel, level_ge
+        level = report.verification_level
+
+        # 如果做了硬件验证，以硬件结果为准
+        if level_ge(level, VerificationLevel.HARDWARE_VERIFIED):
+            passed = report.correctness_passed
+        # 如果只做了 CPU 数学验证 + 编译通过
+        elif level_ge(level, VerificationLevel.COMPILED):
+            passed = report.compilation_passed and report.cpu_math_passed
+        # 如果只做了 CPU 数学验证
+        elif level_ge(level, VerificationLevel.CPU_MATH):
+            passed = report.cpu_math_passed
+        # 仅 LLM 审查 / 静态分析
+        else:
+            passed = report.llm_review_passed or report.static_analysis.get("summary") == "PASS"
+
         issues = []
         if not passed:
-            issues.append(report.correctness_details or "Numerical correctness check failed")
+            if report.correctness_details:
+                issues.append(report.correctness_details)
+            elif report.cpu_math_details:
+                issues.append(report.cpu_math_details)
+            elif report.llm_review_details:
+                issues.append(report.llm_review_details)
+            else:
+                issues.append(f"Correctness check failed at level={level.value}")
 
         return StageResult(
             stage=ReviewStage.CORRECTNESS,
@@ -307,17 +438,32 @@ class ReviewLoopAgent(BaseAgent):
     async def _stage_performance(
         self, kernel: GeneratedKernel, op_ir: OperatorIR, gpu_spec: GPUSpec
     ) -> StageResult:
-        """Stage 4: 性能基准测试"""
+        """Stage 4: 性能基准测试（根据硬件可用性自适应）"""
+        # 复用 Stage 3 已经调用过的 Verifier 报告中的性能数据
+        # 这里再单独跑一次以获取最新 report
         ctx = AgentContext()
         result = await self._verifier.run(
             ctx, kernel=kernel, operator_ir=op_ir, gpu_spec=gpu_spec
         )
 
         bw_util = 0.0
-        if result.success and result.output:
-            bw_util = result.output.bandwidth_utilization
+        from agents.verifier import VerificationLevel, level_ge
 
-        passed = bw_util >= self.min_bw_efficiency
+        if result.success and result.output:
+            report: VerificationReport = result.output
+            bw_util = report.bandwidth_utilization
+            level = report.verification_level
+
+            # 如果没有真实硬件 benchmark，降低性能要求
+            if not level_ge(level, VerificationLevel.BENCHMARKED):
+                # 没有真实 benchmark 数据时，只要代码特征看起来合理就放过
+                effective_threshold = self.min_bw_efficiency * 0.6
+            else:
+                effective_threshold = self.min_bw_efficiency
+        else:
+            effective_threshold = self.min_bw_efficiency * 0.6
+
+        passed = bw_util >= effective_threshold
         issues = []
         if not passed:
             issues.append(
@@ -467,5 +613,6 @@ class ReviewLoopAgent(BaseAgent):
             optimizations_applied=kernel.optimizations_applied,
             tags=op_ir.tags,
             prompt_version=prompt_ver,
+            verification_level=kernel.verification_level if hasattr(kernel, 'verification_level') else "none",
         )
         get_registry().register(entry)

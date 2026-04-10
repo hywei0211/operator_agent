@@ -15,6 +15,8 @@ from prompts.code_gen_prompts import (
     build_hip_codegen_prompt,
     build_triton_codegen_prompt,
     build_ascendc_codegen_prompt,
+    build_cuda_backward_prompt,
+    build_ascendc_backward_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,6 +95,73 @@ class CodeGenAgent(BaseAgent):
         except Exception as e:
             self.set_status(AgentStatus.FAILED)
             logger.exception(f"[CodeGen] Failed: {e}")
+            return self.failure_result(str(e))
+
+    # ── 反向传播内核生成 ──────────────────────────────────────
+
+    async def generate_backward(self, context: AgentContext, **kwargs) -> AgentResult:
+        """
+        生成 backward kernel。
+        需要: operator_ir (含 backward_math_description)、gpu_spec、forward_kernel (可选)
+        """
+        self._start_timer()
+        self.set_status(AgentStatus.RUNNING)
+
+        operator_ir: Optional[OperatorIR] = kwargs.get("operator_ir")
+        gpu_spec: Optional[GPUSpec] = kwargs.get("gpu_spec")
+        forward_kernel: Optional[GeneratedKernel] = kwargs.get("forward_kernel")
+
+        if operator_ir is None:
+            return self.failure_result("No OperatorIR provided for backward generation")
+        if not operator_ir.backward_math_description:
+            return self.failure_result(f"No backward_math_description for {operator_ir.name}")
+        if gpu_spec is None:
+            return self.failure_result("No GPUSpec provided")
+
+        try:
+            backend = self._select_backend(gpu_spec)
+            forward_code = forward_kernel.source_code if forward_kernel else ""
+
+            logger.info(f"[CodeGen] Generating backward {backend.value} kernel for {operator_ir.name}")
+
+            if backend == GPUBackend.CUDA:
+                prompt = build_cuda_backward_prompt(operator_ir, gpu_spec, forward_code)
+            elif backend == GPUBackend.ASCENDC:
+                prompt = build_ascendc_backward_prompt(operator_ir, gpu_spec, forward_code)
+            else:
+                # 其他后端：用 CUDA backward prompt 做通用模板
+                prompt = build_cuda_backward_prompt(operator_ir, gpu_spec, forward_code)
+
+            if self.llm_client:
+                response = await self.call_llm(prompt, max_tokens=8192)
+                backward_kernel = self._parse_kernel_response(
+                    response, f"{operator_ir.name}_backward",
+                    backend.value, gpu_spec.model_name)
+            else:
+                # 无 LLM: 生成占位模板
+                backward_kernel = GeneratedKernel(
+                    operator_name=f"{operator_ir.name}_backward",
+                    backend=backend.value,
+                    target_gpu=gpu_spec.model_name,
+                    source_code=f"// TODO: backward kernel for {operator_ir.name}\n"
+                                f"// Math: {operator_ir.backward_math_description}\n",
+                    build_flags=["-O3"],
+                )
+
+            logger.info(f"[CodeGen] Backward kernel generated: {len(backward_kernel.source_code)} chars")
+
+            return self.success_result(
+                output=backward_kernel,
+                metrics={
+                    "backend": backend.value,
+                    "code_length": len(backward_kernel.source_code),
+                    "type": "backward",
+                }
+            )
+
+        except Exception as e:
+            self.set_status(AgentStatus.FAILED)
+            return self.failure_result(str(e))
             return self.failure_result(str(e))
 
     def _select_backend(self, gpu_spec: GPUSpec) -> GPUBackend:

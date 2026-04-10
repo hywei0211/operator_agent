@@ -106,6 +106,11 @@ class OperatorIR:
     reference_impl: str = ""            # PyTorch参考实现代码
     hyperparams: dict[str, Any] = field(default_factory=dict)  # 超参数
 
+    # 反向传播
+    backward_math_description: str = "" # 反向传播数学公式，如 "grad_x = grad_y * sigmoid(x) * (1 + x*(1-sigmoid(x)))"
+    backward_reference_impl: str = ""   # PyTorch backward 参考实现
+    saved_for_backward: list[str] = field(default_factory=list)  # forward 中需保存的张量名，如 ["x"] 或 ["Q","K","V"]
+
     # 复杂度分析
     flops_formula: str = ""             # FLOPs计算公式
     memory_reads_formula: str = ""      # 内存读取量公式
@@ -175,6 +180,11 @@ class GeneratedKernel:
     # 验证结果
     correctness_verified: bool = False
     benchmark_results: dict = field(default_factory=dict)
+    verification_level: str = "none"  # none/static/llm_review/cpu_math/compiled/hw_verified/benchmarked
+
+    # 反向传播内核
+    backward_source_code: str = ""      # 生成的 backward kernel 代码
+    backward_build_flags: list[str] = field(default_factory=list)
 
 
 @dataclass

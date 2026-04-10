@@ -45,6 +45,7 @@ class OperatorEntry:
     # 版本（SQLite 新增）
     version: int = 1
     prompt_version: str = ""  # 记录生成时使用的 prompt 版本
+    verification_level: str = "none"  # none/static/llm_review/cpu_math/compiled/hw_verified/benchmarked
 
     @property
     def registry_key(self) -> str:
@@ -102,7 +103,8 @@ class OperatorRegistry:
                 tags TEXT DEFAULT '[]',
                 version INTEGER DEFAULT 1,
                 is_current INTEGER DEFAULT 1,
-                prompt_version TEXT DEFAULT ''
+                prompt_version TEXT DEFAULT '',
+                verification_level TEXT DEFAULT 'none'
             );
             CREATE INDEX IF NOT EXISTS idx_op_gpu
                 ON operators(operator_name, gpu_model);
@@ -111,6 +113,11 @@ class OperatorRegistry:
             CREATE INDEX IF NOT EXISTS idx_backend
                 ON operators(backend);
         """)
+        # 兼容旧表：如果 verification_level 列不存在则加上
+        try:
+            conn.execute("SELECT verification_level FROM operators LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE operators ADD COLUMN verification_level TEXT DEFAULT 'none'")
         conn.commit()
 
     def _migrate_json_if_needed(self):
@@ -270,8 +277,9 @@ class OperatorRegistry:
                 operator_name, gpu_model, backend, source_code, header_code,
                 build_flags, launch_config, correctness_passed, max_relative_error,
                 bandwidth_utilization, verified_shapes, created_at, iteration_count,
-                optimizations_applied, tags, version, is_current, prompt_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                optimizations_applied, tags, version, is_current, prompt_version,
+                verification_level
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         """, (
             entry.operator_name, entry.gpu_model, entry.backend,
             entry.source_code, entry.header_code,
@@ -280,11 +288,12 @@ class OperatorRegistry:
             entry.bandwidth_utilization, json.dumps(entry.verified_shapes),
             entry.created_at, entry.iteration_count,
             json.dumps(entry.optimizations_applied), json.dumps(entry.tags),
-            entry.version, entry.prompt_version,
+            entry.version, entry.prompt_version, entry.verification_level,
         ))
         conn.commit()
 
     def _row_to_entry(self, row: sqlite3.Row) -> OperatorEntry:
+        keys = row.keys()
         return OperatorEntry(
             operator_name=row["operator_name"],
             gpu_model=row["gpu_model"],
@@ -302,7 +311,8 @@ class OperatorRegistry:
             optimizations_applied=json.loads(row["optimizations_applied"]) if row["optimizations_applied"] else [],
             tags=json.loads(row["tags"]) if row["tags"] else [],
             version=row["version"],
-            prompt_version=row["prompt_version"] if "prompt_version" in row.keys() else "",
+            prompt_version=row["prompt_version"] if "prompt_version" in keys else "",
+            verification_level=row["verification_level"] if "verification_level" in keys else "none",
         )
 
 

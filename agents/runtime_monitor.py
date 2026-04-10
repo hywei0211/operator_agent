@@ -181,8 +181,8 @@ class RuntimeMonitorAgent(BaseAgent):
         except (FileNotFoundError, Exception):
             pass
 
-        logger.debug(f"[RuntimeMonitor] No GPU query tool available, returning estimate")
-        return 0.75  # 无法查询时返回估算值
+        logger.warning(f"[RuntimeMonitor] No GPU query tool available for {gpu_model}, utilization unknown")
+        return -1.0  # 无法查询时返回 -1 表示未知
 
     def _query_memory_used(self, gpu_model: str) -> float:
         """查询 GPU 显存使用量 (GB)"""
@@ -209,7 +209,15 @@ class RuntimeMonitorAgent(BaseAgent):
 
         # 检查 GPU 利用率
         for gm in metrics.gpu_metrics:
-            if gm.utilization_pct < self.min_gpu_utilization:
+            if gm.utilization_pct < 0:
+                # 利用率未知（无查询工具），报告 unknown 而不是误报
+                alerts.append({
+                    "level": "info",
+                    "type": "utilization_unknown",
+                    "message": f"GPU {gm.gpu_id} utilization unknown (no query tool available)",
+                    "gpu": gm.gpu_id,
+                })
+            elif gm.utilization_pct < self.min_gpu_utilization:
                 alerts.append({
                     "level": "warning",
                     "type": "low_utilization",

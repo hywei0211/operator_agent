@@ -108,14 +108,17 @@ class TrainingExecutorAgent(BaseAgent):
             logger.info(f"[TrainingExecutor] Script: {script_path}")
             logger.info(f"[TrainingExecutor] Launch: {launch_cmd[:100]}...")
 
-            # 实际启动（如果配置了 dry_run=False）
-            if not (self.config or {}).get("dry_run", True):
+            # 实际启动（默认 dry_run=True，生成启动脚本但不自动运行）
+            # 设置 dry_run=False 会自动启动训练进程
+            dry_run = (self.config or {}).get("dry_run", True)
+            if not dry_run:
                 proc = await self._launch_process(str(launch_script), env)
                 job.pid = proc.pid
                 job.status = "running"
             else:
                 job.status = "dry_run_ready"
-                logger.info(f"[TrainingExecutor] dry_run=True, not actually launching")
+                logger.info(f"[TrainingExecutor] dry_run=True (default), training not launched. "
+                            f"Run manually: bash {launch_script}")
 
             context.add_artifact("training_job", job)
             return self.success_result(
@@ -230,6 +233,71 @@ class TrainingExecutorAgent(BaseAgent):
             ]
 
         lines += ["", "# ─────────────────────────────────────────────────────────"]
+        return "\n".join(lines)
+
+    def _generate_autograd_wrappers(self, kernels: dict, plan: Optional[TrainingPlan]) -> str:
+        """
+        为每个算子生成 torch.autograd.Function 包装，让自定义 kernel 支持训练中的反向传播。
+
+        如果 kernel 有 backward_source_code，生成完整的 forward+backward Function。
+        否则只生成 forward 包装（backward 由 PyTorch autograd 自动处理）。
+        """
+        lines = [
+            "",
+            "# ── Auto-generated autograd wrappers ─────────────────────",
+            "import torch",
+            "import torch.nn.functional as F",
+            "",
+        ]
+
+        for key, kernel in kernels.items():
+            if not isinstance(kernel, GeneratedKernel):
+                continue
+
+            op_name = kernel.operator_name
+            class_name = op_name.replace("_", " ").title().replace(" ", "") + "Function"
+            has_backward = bool(kernel.backward_source_code)
+
+            lines.append(f"class {class_name}(torch.autograd.Function):")
+            lines.append(f"    '''Auto-generated autograd wrapper for {op_name}'''")
+            lines.append(f"    @staticmethod")
+            lines.append(f"    def forward(ctx, x):")
+            lines.append(f"        # 尝试用自定义 kernel，失败时 fallback 到 PyTorch")
+            lines.append(f"        try:")
+            lines.append(f"            output = torch.ops.custom.{op_name}_forward(x)")
+            lines.append(f"        except Exception:")
+            lines.append(f"            output = F.{op_name}(x) if hasattr(F, '{op_name}') else x")
+            lines.append(f"        ctx.save_for_backward(x)")
+            lines.append(f"        return output")
+            lines.append(f"")
+            lines.append(f"    @staticmethod")
+            lines.append(f"    def backward(ctx, grad_output):")
+            lines.append(f"        x, = ctx.saved_tensors")
+
+            if has_backward:
+                lines.append(f"        try:")
+                lines.append(f"            grad_input = torch.ops.custom.{op_name}_backward(grad_output, x)")
+                lines.append(f"        except Exception:")
+                lines.append(f"            # Fallback: 用 PyTorch autograd")
+                lines.append(f"            x_f = x.float().requires_grad_(True)")
+                lines.append(f"            y = F.{op_name}(x_f) if hasattr(F, '{op_name}') else x_f")
+                lines.append(f"            y.backward(grad_output.float())")
+                lines.append(f"            grad_input = x_f.grad.to(grad_output.dtype)")
+            else:
+                lines.append(f"        # 无自定义 backward kernel，用 PyTorch autograd")
+                lines.append(f"        x_f = x.float().requires_grad_(True)")
+                lines.append(f"        y = F.{op_name}(x_f) if hasattr(F, '{op_name}') else x_f")
+                lines.append(f"        y.backward(grad_output.float())")
+                lines.append(f"        grad_input = x_f.grad.to(grad_output.dtype)")
+
+            lines.append(f"        return grad_input")
+            lines.append(f"")
+            lines.append(f"def {op_name}_custom(x):")
+            lines.append(f"    '''Drop-in replacement for F.{op_name}(x) with custom kernel + backward'''")
+            lines.append(f"    return {class_name}.apply(x)")
+            lines.append(f"")
+
+        lines.append("# ─────────────────────────────────────────────────────────")
         return "\n".join(lines)
 
     def _patch_training_code(

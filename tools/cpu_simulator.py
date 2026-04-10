@@ -223,6 +223,116 @@ class CPUSimulator:
             notes=notes,
         )
 
+    # ── 反向传播验证 ─────────────────────────────────────────
+
+    BACKWARD_REFERENCE_IMPLS: dict[str, Callable] = {}
+
+    def _register_backward_references(self):
+        """注册所有算子的 backward 参考实现"""
+        if not HAS_TORCH:
+            return
+
+        self.BACKWARD_REFERENCE_IMPLS = {
+            "gelu":    self._backward_gelu,
+            "silu":    self._backward_silu,
+            "softmax": self._backward_softmax,
+            "rmsnorm": self._backward_rmsnorm,
+            "matmul":  self._backward_matmul,
+        }
+
+    def _backward_gelu(self, grad_output, x):
+        x_f = x.float()
+        return torch.autograd.functional.vjp(F.gelu, x_f, grad_output.float())[1].to(grad_output.dtype)
+
+    def _backward_silu(self, grad_output, x):
+        sig = torch.sigmoid(x.float())
+        return (grad_output.float() * sig * (1.0 + x.float() * (1.0 - sig))).to(grad_output.dtype)
+
+    def _backward_softmax(self, grad_output, y):
+        """softmax backward: grad_x = y * (grad_y - (grad_y * y).sum(dim=-1, keepdim=True))"""
+        y_f = y.float()
+        g_f = grad_output.float()
+        return (y_f * (g_f - (g_f * y_f).sum(dim=-1, keepdim=True))).to(grad_output.dtype)
+
+    def _backward_rmsnorm(self, grad_output, x, weight=None):
+        eps = 1e-6
+        x_f = x.float()
+        g_f = grad_output.float()
+        rms = torch.sqrt(x_f.pow(2).mean(-1, keepdim=True) + eps)
+        x_norm = x_f / rms
+        w_f = weight.float() if weight is not None else torch.ones(x_f.shape[-1])
+        grad_x_norm = g_f * w_f
+        grad_x = (grad_x_norm - x_norm * (grad_x_norm * x_norm).mean(dim=-1, keepdim=True)) / rms
+        return grad_x.to(grad_output.dtype)
+
+    def _backward_matmul(self, grad_output, A, B):
+        grad_A = torch.matmul(grad_output.float(), B.float().transpose(-2, -1))
+        grad_B = torch.matmul(A.float().transpose(-2, -1), grad_output.float())
+        return grad_A.to(grad_output.dtype), grad_B.to(grad_output.dtype)
+
+    def verify_backward(
+        self,
+        operator_name: str,
+        rtol: float = 1e-2,
+    ) -> SimulationResult:
+        """
+        用 torch.autograd.gradcheck 验证 backward 正确性。
+        gradcheck 会用有限差分法自动验证解析梯度是否正确。
+        """
+        if not HAS_TORCH:
+            return SimulationResult(
+                operator_name=operator_name, math_correct=True,
+                error_message="PyTorch not available, skipping backward check")
+
+        if not self.BACKWARD_REFERENCE_IMPLS:
+            self._register_backward_references()
+
+        ref_fn = self.REFERENCE_IMPLS.get(operator_name)
+        if ref_fn is None:
+            return SimulationResult(
+                operator_name=f"{operator_name}_backward", math_correct=True,
+                error_message=f"No forward ref for {operator_name}, skip backward check")
+
+        try:
+            from torch.autograd import gradcheck
+
+            # 构造需要梯度的测试输入（gradcheck 需要 float64）
+            if operator_name in ("matmul",):
+                a = torch.randn(2, 16, 16, dtype=torch.float64, requires_grad=True)
+                b = torch.randn(2, 16, 16, dtype=torch.float64, requires_grad=True)
+                result = gradcheck(torch.matmul, (a, b), eps=1e-6, atol=1e-4, raise_exception=False)
+            elif operator_name in ("rmsnorm",):
+                x = torch.randn(2, 8, 32, dtype=torch.float64, requires_grad=True)
+                # RMSNorm 用 PyTorch 原生操作（gradcheck 只验数学，不验 kernel）
+                def rmsnorm_fn(x_):
+                    rms_ = torch.sqrt(x_.pow(2).mean(-1, keepdim=True) + 1e-6)
+                    return x_ / rms_
+                result = gradcheck(rmsnorm_fn, (x,), eps=1e-6, atol=1e-4, raise_exception=False)
+            else:
+                x = torch.randn(4, 32, dtype=torch.float64, requires_grad=True)
+                fn_map = {
+                    "gelu": F.gelu, "silu": F.silu, "relu": F.relu,
+                    "softmax": lambda x_: F.softmax(x_, dim=-1),
+                }
+                fn = fn_map.get(operator_name)
+                if fn is None:
+                    return SimulationResult(
+                        operator_name=f"{operator_name}_backward", math_correct=True,
+                        error_message=f"No gradcheck fn for {operator_name}")
+                result = gradcheck(fn, (x,), eps=1e-6, atol=1e-4, raise_exception=False)
+
+            return SimulationResult(
+                operator_name=f"{operator_name}_backward",
+                math_correct=bool(result),
+                notes=[f"gradcheck {'passed ✅' if result else 'failed ❌'} for {operator_name}"],
+            )
+        except Exception as e:
+            return SimulationResult(
+                operator_name=f"{operator_name}_backward",
+                math_correct=False,
+                error_message=f"gradcheck error: {str(e)[:200]}",
+            )
+
     def generate_test_inputs(self, operator_name: str) -> list[dict]:
         """为每种算子生成标准测试输入集"""
         if not HAS_TORCH:

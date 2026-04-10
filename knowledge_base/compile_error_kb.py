@@ -684,6 +684,46 @@ class CompileErrorKB:
         except Exception as e:
             logger.warning(f"[CompileErrorKB] Failed to save: {e}")
 
+    def export_patterns(self, output_path: str):
+        """导出所有错误模式到 JSON 文件（可提交 git 或分享给其他人）"""
+        data = {pid: asdict(p) for pid, p in self._patterns.items()}
+        with open(output_path, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info(f"[CompileErrorKB] Exported {len(data)} patterns to {output_path}")
+        return len(data)
+
+    def import_patterns(self, input_path: str, overwrite: bool = False) -> int:
+        """从 JSON 文件导入错误模式（合并到现有知识库）"""
+        with open(input_path) as f:
+            data = json.load(f)
+
+        imported = 0
+        for pid, d in data.items():
+            if pid in self._patterns and not overwrite:
+                # 已存在的模式：累加 occurrence_count
+                self._patterns[pid].occurrence_count += d.get("occurrence_count", 0)
+            else:
+                self._patterns[pid] = ErrorPattern(**d)
+                imported += 1
+
+        self._save()
+        logger.info(f"[CompileErrorKB] Imported {imported} new patterns from {input_path} "
+                    f"(total: {len(self._patterns)})")
+        return imported
+
+    def stats(self) -> dict:
+        """返回知识库统计信息"""
+        by_backend = {}
+        for p in self._patterns.values():
+            by_backend[p.backend] = by_backend.get(p.backend, 0) + 1
+        total_occurrences = sum(p.occurrence_count for p in self._patterns.values())
+        return {
+            "total_patterns": len(self._patterns),
+            "by_backend": by_backend,
+            "total_occurrences": total_occurrences,
+            "store_path": self.store_path,
+        }
+
 
 # ── 全局单例 ──────────────────────────────────────────────
 

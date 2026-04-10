@@ -147,7 +147,7 @@ async def main():
     parser.add_argument("--code", "-c", help="内联训练代码（用于快速测试）")
     parser.add_argument("--gpus", "-g", nargs="+", required=True, help="目标 GPU 型号列表")
     parser.add_argument("--llm", default="mock",
-                        choices=["openai", "anthropic", "mock"],
+                        choices=["qwen", "openai", "anthropic", "mock"],
                         help="LLM 后端（默认 mock，不需要 API key）")
     parser.add_argument("--max-review-iters", type=int, default=5)
     parser.add_argument("--no-dry-run", action="store_true",

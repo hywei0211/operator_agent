@@ -1,15 +1,105 @@
 """
 LLM 客户端封装
 支持：OpenAI GPT-4 / Anthropic Claude / 阿里云 Qwen (DashScope) / Mock
+内置 LLM 响应缓存（content-addressed，避免重复调用浪费时间和金钱）
 """
 import asyncio
+import hashlib
+import json as _json
 import logging
 import os
 import re
+import sqlite3
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_LLM_CACHE_PATH = os.path.join(os.path.dirname(__file__), "../.llm_cache.db")
+
+
+class LLMCache:
+    """
+    LLM 响应缓存（SQLite）
+    key = hash(model + system + user + temperature)
+    自动过期：默认 7 天
+    """
+
+    def __init__(self, db_path: str = _LLM_CACHE_PATH, ttl_seconds: int = 7 * 86400):
+        self.db_path = db_path
+        self.ttl = ttl_seconds
+        self._conn: Optional[sqlite3.Connection] = None
+        self._init_db()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        return self._conn
+
+    def _init_db(self):
+        conn = self._get_conn()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                cache_key TEXT PRIMARY KEY,
+                response TEXT NOT NULL,
+                model TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.commit()
+
+    @staticmethod
+    def _make_key(model: str, system: str, user: str, temperature: float) -> str:
+        raw = f"{model}||{system}||{user}||{temperature}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def get(self, model: str, system: str, user: str, temperature: float) -> Optional[str]:
+        key = self._make_key(model, system, user, temperature)
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT response, created_at FROM llm_cache WHERE cache_key=?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        if time.time() - row[1] > self.ttl:
+            conn.execute("DELETE FROM llm_cache WHERE cache_key=?", (key,))
+            conn.commit()
+            return None
+        logger.debug(f"[LLMCache] Hit: key={key[:8]}...")
+        return row[0]
+
+    def put(self, model: str, system: str, user: str, temperature: float, response: str):
+        key = self._make_key(model, system, user, temperature)
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (cache_key, response, model, created_at) VALUES (?, ?, ?, ?)",
+            (key, response, model, time.time())
+        )
+        conn.commit()
+
+    def stats(self) -> dict:
+        conn = self._get_conn()
+        total = conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0]
+        return {"total_cached": total, "db_path": self.db_path}
+
+    def clear(self):
+        conn = self._get_conn()
+        conn.execute("DELETE FROM llm_cache")
+        conn.commit()
+        logger.info("[LLMCache] Cache cleared")
+
+
+# 全局缓存实例
+_llm_cache: Optional[LLMCache] = None
+
+
+def get_llm_cache() -> LLMCache:
+    global _llm_cache
+    if _llm_cache is None:
+        _llm_cache = LLMCache()
+    return _llm_cache
 
 
 def _load_env():
@@ -31,10 +121,14 @@ _load_env()
 
 
 class BaseLLMClient(ABC):
-    """LLM 客户端抽象基类"""
+    """LLM 客户端抽象基类（内置缓存）"""
+
+    # 子类需要设置 model name，用于缓存 key
+    _model_name: str = "unknown"
+    _use_cache: bool = True
 
     @abstractmethod
-    async def chat(
+    async def _raw_chat(
         self,
         system: str,
         user: str,
@@ -42,6 +136,28 @@ class BaseLLMClient(ABC):
         max_tokens: int = 4096,
     ) -> str:
         raise NotImplementedError
+
+    async def chat(
+        self,
+        system: str,
+        user: str,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+    ) -> str:
+        """带缓存的 chat 接口"""
+        if self._use_cache:
+            cache = get_llm_cache()
+            cached = cache.get(self._model_name, system, user, temperature)
+            if cached is not None:
+                return cached
+
+        response = await self._raw_chat(system, user, temperature, max_tokens)
+
+        if self._use_cache:
+            cache = get_llm_cache()
+            cache.put(self._model_name, system, user, temperature, response)
+
+        return response
 
 
 class OpenAIClient(BaseLLMClient):
@@ -51,6 +167,7 @@ class OpenAIClient(BaseLLMClient):
                  base_url: Optional[str] = None):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.model = model
+        self._model_name = model
         self.base_url = base_url
         self._client = None
 
@@ -66,8 +183,8 @@ class OpenAIClient(BaseLLMClient):
                 raise ImportError("openai package required: pip install openai")
         return self._client
 
-    async def chat(self, system: str, user: str,
-                   temperature: float = 0.1, max_tokens: int = 4096) -> str:
+    async def _raw_chat(self, system: str, user: str,
+                        temperature: float = 0.1, max_tokens: int = 4096) -> str:
         client = self._get_client()
         response = await client.chat.completions.create(
             model=self.model,
@@ -106,6 +223,7 @@ class QwenClient(BaseLLMClient):
             "QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
         self.enable_thinking = enable_thinking
+        self._model_name = self.model
         self._client = None
 
         if not self.api_key:
@@ -113,8 +231,8 @@ class QwenClient(BaseLLMClient):
                 "Qwen API Key 未配置。请设置环境变量 QWEN_API_KEY 或在 .env 文件中添加。"
             )
 
-    async def chat(self, system: str, user: str,
-                   temperature: float = 0.1, max_tokens: int = 8192) -> str:
+    async def _raw_chat(self, system: str, user: str,
+                        temperature: float = 0.1, max_tokens: int = 8192) -> str:
         """
         直接用 httpx 调用 DashScope OpenAI 兼容接口
         避免 openai 包的版本兼容性问题
@@ -183,6 +301,7 @@ class AnthropicClient(BaseLLMClient):
     def __init__(self, api_key: Optional[str] = None, model: str = "claude-opus-4-5"):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         self.model = model
+        self._model_name = model
         self._client = None
 
     def _get_client(self):
@@ -194,8 +313,8 @@ class AnthropicClient(BaseLLMClient):
                 raise ImportError("anthropic package required: pip install anthropic")
         return self._client
 
-    async def chat(self, system: str, user: str,
-                   temperature: float = 0.1, max_tokens: int = 4096) -> str:
+    async def _raw_chat(self, system: str, user: str,
+                        temperature: float = 0.1, max_tokens: int = 4096) -> str:
         client = self._get_client()
         response = await client.messages.create(
             model=self.model,
@@ -392,8 +511,10 @@ __global__ void matmul_kernel(
     def __init__(self, responses: dict[str, str] = None):
         self.responses = responses or {}
         self.call_count = 0
+        self._model_name = "mock"
+        self._use_cache = False  # Mock 不需要缓存
 
-    async def chat(self, system: str, user: str,
+    async def _raw_chat(self, system: str, user: str,
                    temperature: float = 0.1, max_tokens: int = 4096) -> str:
         self.call_count += 1
 

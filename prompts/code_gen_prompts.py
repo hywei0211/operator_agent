@@ -10,25 +10,43 @@ logger = logging.getLogger(__name__)
 
 
 def _get_fewshot_example(op_name: str, gpu_model: str, backend: str = "cuda") -> str:
-    """从算子仓库中查找历史成功代码作为 few-shot 示例"""
+    """从算子仓库中查找历史成功代码作为 few-shot 示例（优先选最佳验证等级和最高性能的）"""
     try:
         from operators.registry import get_registry
         reg = get_registry()
 
-        # 优先精确匹配（同算子 + 同 GPU）
+        # 收集所有匹配候选
+        candidates = []
+
+        # 精确匹配（同算子 + 同 GPU）
         entry = reg.lookup(op_name, gpu_model)
-
-        # 退而求其次：同算子在其他 GPU 上的成功实现
-        if entry is None or not entry.correctness_passed:
-            entry = reg.find_similar(op_name, gpu_model)
-
         if entry and entry.correctness_passed and entry.source_code:
-            # 截断到合理长度避免 prompt 过长
-            code = entry.source_code[:3000]
-            if len(entry.source_code) > 3000:
-                code += "\n// ... (truncated)"
-            return f"""
-以下是在 {entry.gpu_model} 上验证通过的 {op_name} 参考实现（请参考其结构和风格）：
+            candidates.append(entry)
+
+        # 相似匹配（同算子在其他 GPU 上）
+        similar = reg.find_similar(op_name, gpu_model)
+        if similar and similar.correctness_passed and similar.source_code:
+            candidates.append(similar)
+
+        if not candidates:
+            return ""
+
+        # 按验证等级 + 带宽利用率排序，选最佳
+        _level_rank = {"benchmarked": 6, "hw_verified": 5, "compiled": 4,
+                       "cpu_math": 3, "llm_review": 2, "static": 1, "none": 0}
+        candidates.sort(key=lambda e: (
+            _level_rank.get(getattr(e, 'verification_level', 'none'), 0),
+            e.bandwidth_utilization,
+        ), reverse=True)
+        best = candidates[0]
+
+        # 截断到合理长度避免 prompt 过长
+        code = best.source_code[:3000]
+        if len(best.source_code) > 3000:
+            code += "\n// ... (truncated)"
+        vl = getattr(best, 'verification_level', 'unknown')
+        return f"""
+以下是在 {best.gpu_model} 上验证通过的 {op_name} 参考实现（验证等级: {vl}, BW: {best.bandwidth_utilization:.0%}）：
 ```{backend}
 {code}
 ```
@@ -39,17 +57,49 @@ def _get_fewshot_example(op_name: str, gpu_model: str, backend: str = "cuda") ->
     return ""
 
 
-def _get_cuda_forbidden() -> str:
-    """从编译错误知识库动态生成禁用列表，降级到硬编码"""
+def _get_backend_forbidden(backend: str) -> str:
+    """从编译错误知识库动态生成指定后端的禁用列表"""
     try:
         from knowledge_base.compile_error_kb import get_compile_error_kb
         kb = get_compile_error_kb()
-        fragment = kb.generate_prompt_fragment("cuda")
+        fragment = kb.generate_prompt_fragment(backend)
         if fragment and len(fragment) > 50:
-            return fragment + _CUDA_HALF2_EXAMPLES
+            return fragment
     except Exception as e:
-        logger.debug(f"[Prompts] KB unavailable, using fallback: {e}")
+        logger.debug(f"[Prompts] KB unavailable for {backend}: {e}")
+    return ""
+
+
+def _get_cuda_forbidden() -> str:
+    """从编译错误知识库动态生成禁用列表，降级到硬编码"""
+    kb_fragment = _get_backend_forbidden("cuda")
+    if kb_fragment:
+        return kb_fragment + _CUDA_HALF2_EXAMPLES
     return _CUDA_FORBIDDEN_FALLBACK + _CUDA_HALF2_EXAMPLES
+
+
+_HIP_FORBIDDEN = """
+严格禁止使用以下不存在或错误的 HIP API：
+- hipBfloat16ToFloat / hipFloatToBfloat16：不存在，用 __bfloat162float / __float2bfloat16
+- __shfl_sync：HIP 使用 __shfl / __shfl_xor / __shfl_down（无 _sync 后缀）
+- __syncthreads()：HIP 中可用，但注意 wavefront 是 64 线程（不是 CUDA 的 32）
+- hipMallocManaged 在所有设备上不一定可用，优先用 hipMalloc + hipMemcpy
+- 不要使用 __half2float4 / __float2half4 等不存在的向量转换
+- hip_fp16.h 中部分 half2 intrinsic 与 CUDA 不同，优先使用 float 中间精度
+"""
+
+_ASCENDC_FORBIDDEN = """
+严格禁止以下 AscendC 编程错误（常见 LLM 幻觉）：
+- 不要直接用 GM 指针做计算（如 xGm[i] + yGm[i]），必须先 DataCopy 到 UB
+- 不要使用 Sigmoid / Tanh / Gelu 等高级 API（AscendC 没有内置这些），必须手动用 Exp/Add/Div 组合实现
+- 不要使用 malloc / new / std::vector 等动态内存分配，UB 空间由 pipe.InitBuffer 管理
+- 不要使用 printf / std::cout 等 IO 操作
+- DataCopy 的 count 参数必须是 32 字节对齐（FP16 时为 16 的倍数）
+- Cube 矩阵乘法的 M/K/N 维度必须是 16 的倍数
+- 不要在 __aicore__ 函数外访问 LocalTensor
+- TPipe 不是线程安全的，每个 AI Core 独立实例
+- TQue 的模板参数必须与实际使用匹配（VECIN 用于输入，VECOUT 用于输出）
+"""
 
 
 _CUDA_HALF2_EXAMPLES = """
@@ -190,6 +240,11 @@ def build_cuda_simple_prompt(op_ir: OperatorIR, gpu_spec: GPUSpec) -> str:
 
 
 def build_hip_codegen_prompt(op_ir: OperatorIR, gpu_spec: GPUSpec) -> str:
+    op_name = op_ir.name.lower()
+    hip_kb = _get_backend_forbidden("hip")
+    hip_forbidden = (hip_kb + "\n" + _HIP_FORBIDDEN) if hip_kb else _HIP_FORBIDDEN
+    fewshot = _get_fewshot_example(op_name, gpu_spec.model_name, "hip")
+
     return f"""你是一位HIP/ROCm内核编程专家，擅长为AMD GPU编写高性能HIP内核。
 
 目标GPU规格：
@@ -233,7 +288,9 @@ def build_hip_codegen_prompt(op_ir: OperatorIR, gpu_spec: GPUSpec) -> str:
   }},
   "optimizations": [...],
   "estimated_efficiency": 0.80
-}}"""
+}}
+{fewshot}
+{hip_forbidden}"""
 
 
 def build_triton_codegen_prompt(op_ir: OperatorIR, gpu_specs: list[GPUSpec]) -> str:
@@ -278,6 +335,11 @@ def build_triton_codegen_prompt(op_ir: OperatorIR, gpu_specs: list[GPUSpec]) -> 
 
 
 def build_ascendc_codegen_prompt(op_ir: OperatorIR, gpu_spec: GPUSpec) -> str:
+    op_name = op_ir.name.lower()
+    ascendc_kb = _get_backend_forbidden("ascendc")
+    ascendc_forbidden = (ascendc_kb + "\n" + _ASCENDC_FORBIDDEN) if ascendc_kb else _ASCENDC_FORBIDDEN
+    fewshot = _get_fewshot_example(op_name, gpu_spec.model_name, "cpp")
+
     return f"""你是一位华为昇腾 AscendC 算子编程专家，熟悉 DaVinci 架构和 AscendC 编程模型。
 
 目标 GPU 规格：
@@ -328,6 +390,99 @@ AscendC 关键 API 参考：
   }},
   "optimizations": ["列出应用的优化技术，如双缓冲、向量化、Tile分块等"],
   "estimated_efficiency": 0.75
+}}
+{fewshot}
+{ascendc_forbidden}"""
+
+
+# ════════════════════════════════════════════════════════
+# 反向传播 Prompt 构造器
+# ════════════════════════════════════════════════════════
+
+def build_cuda_backward_prompt(op_ir: OperatorIR, gpu_spec: GPUSpec, forward_code: str = "") -> str:
+    """构造 CUDA backward kernel 的生成 prompt"""
+    sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "80"
+    saved = ", ".join(op_ir.saved_for_backward) if op_ir.saved_for_backward else "input"
+
+    forward_section = ""
+    if forward_code:
+        forward_section = f"""
+以下是已生成的 forward kernel（请确保 backward 与之数学一致）：
+```cuda
+{forward_code[:2000]}
+```"""
+
+    return f"""你是一位 CUDA 内核编程专家。请为以下算子生成 **反向传播 (backward)** 内核。
+
+目标 GPU: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
+显存带宽: {gpu_spec.memory.bandwidth_gbps} GB/s
+
+算子: {op_ir.name}
+Forward 数学定义: {op_ir.math_description}
+Backward 数学定义: {op_ir.backward_math_description}
+
+Forward 保存的张量 (saved_for_backward): [{saved}]
+
+Backward 参考实现（PyTorch）：
+```python
+{op_ir.backward_reference_impl}
+```
+{forward_section}
+
+要求：
+1. 输入为 grad_output + saved_for_backward 中的张量
+2. 输出为每个 forward input 的梯度 (grad_input)
+3. 使用 float 精度做中间计算（输入输出可以是 half）
+4. 处理边界条件，确保 idx < N
+5. 不要使用 atomicAdd（除非规约操作必须使用）
+6. kernel 函数命名为 {op_ir.name}_backward_kernel
+
+{_get_cuda_forbidden()}
+
+返回格式（JSON）：
+{{
+  "kernel_code": "完整的 CUDA C++ backward kernel 代码",
+  "build_flags": ["-O3", "-arch=sm_{sm}"],
+  "optimizations": ["列出优化技术"]
+}}"""
+
+
+def build_ascendc_backward_prompt(op_ir: OperatorIR, gpu_spec: GPUSpec, forward_code: str = "") -> str:
+    """构造 AscendC backward kernel 的生成 prompt"""
+    saved = ", ".join(op_ir.saved_for_backward) if op_ir.saved_for_backward else "input"
+
+    return f"""你是一位华为昇腾 AscendC 算子编程专家。请为以下算子生成 **反向传播 (backward)** 内核。
+
+目标设备: {gpu_spec.model_name} ({gpu_spec.architecture})
+AI Core 数量: {gpu_spec.compute_units}
+
+算子: {op_ir.name}
+Forward 数学定义: {op_ir.math_description}
+Backward 数学定义: {op_ir.backward_math_description}
+
+Forward 保存的张量: [{saved}]
+
+Backward 参考实现（PyTorch）：
+```python
+{op_ir.backward_reference_impl}
+```
+
+要求：
+1. 使用 AscendC 框架，头文件 kernel_operator.h
+2. 输入为 grad_output + saved_for_backward 中的张量（从 GM 搬到 UB）
+3. 输出为 grad_input（从 UB 搬回 GM）
+4. 使用双缓冲流水线
+5. DataCopy count 必须 16 对齐（FP16）
+6. 类命名为 {op_ir.name.capitalize()}BackwardKernel
+7. extern "C" 入口函数命名为 {op_ir.name}_backward_kernel
+
+{_ASCENDC_FORBIDDEN}
+
+返回格式（JSON）：
+{{
+  "kernel_code": "完整的 AscendC C++ backward kernel 代码",
+  "build_flags": ["--target=ascend910b", "-O2"],
+  "optimizations": ["列出优化技术"]
 }}"""
 
 

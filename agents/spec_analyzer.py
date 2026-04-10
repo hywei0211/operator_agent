@@ -42,6 +42,22 @@ def flash_attention_ref(Q, K, V, scale=None):
     attn = F.softmax(attn, dim=-1)
     return torch.matmul(attn, V)
 """,
+        "backward_math_description": "P=softmax(QK^T/sqrt(d)); dV=P^T@dO; dP=dO@V^T; dS=P*(dP-sum(dP*P,dim=-1,keepdim)); dQ=dS@K/sqrt(d); dK=dS^T@Q/sqrt(d)",
+        "backward_reference_impl": """
+import torch
+import torch.nn.functional as F
+def flash_attention_backward(grad_output, Q, K, V, scale=None):
+    if scale is None:
+        scale = Q.shape[-1] ** -0.5
+    P = F.softmax(torch.matmul(Q, K.transpose(-2, -1)) * scale, dim=-1)
+    grad_V = torch.matmul(P.transpose(-2, -1), grad_output)
+    grad_P = torch.matmul(grad_output, V.transpose(-2, -1))
+    grad_S = P * (grad_P - (grad_P * P).sum(dim=-1, keepdim=True))
+    grad_Q = torch.matmul(grad_S, K) * scale
+    grad_K = torch.matmul(grad_S.transpose(-2, -1), Q) * scale
+    return grad_Q, grad_K, grad_V
+""",
+        "saved_for_backward": ["Q", "K", "V"],
         "tags": ["transformer", "attention", "memory_efficient"],
     },
     "rmsnorm": {
@@ -64,6 +80,18 @@ def rmsnorm_ref(x, weight, eps=1e-6):
     rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + eps)
     return x / rms * weight
 """,
+        "backward_math_description": "rms=sqrt(mean(x^2)+eps); x_norm=x/rms; grad_weight=sum(grad_y*x_norm); grad_x=weight/rms*(grad_y - x_norm*mean(grad_y*x_norm, dim=-1, keepdim=True))",
+        "backward_reference_impl": """
+import torch
+def rmsnorm_backward(grad_output, x, weight, eps=1e-6):
+    rms = torch.sqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    x_norm = x.float() / rms
+    grad_weight = (grad_output.float() * x_norm).sum(dim=tuple(range(grad_output.ndim - 1)))
+    grad_x_norm = grad_output.float() * weight.float()
+    grad_x = (grad_x_norm - x_norm * (grad_x_norm * x_norm).mean(dim=-1, keepdim=True)) / rms
+    return grad_x.to(x.dtype), grad_weight.to(weight.dtype)
+""",
+        "saved_for_backward": ["x", "weight"],
         "tags": ["normalization", "llama", "transformer"],
     },
     "gelu": {
@@ -84,7 +112,104 @@ import torch
 def gelu_ref(x):
     return torch.nn.functional.gelu(x)
 """,
+        "backward_math_description": "cdf = 0.5*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))); pdf = sqrt(2/pi)*exp(-0.5*inner^2)*(1+3*0.044715*x^2); grad_x = grad_y * (cdf + x * pdf)",
+        "backward_reference_impl": """
+import torch
+def gelu_backward(grad_output, x):
+    # PyTorch autograd handles this automatically
+    x = x.float().requires_grad_(True)
+    y = torch.nn.functional.gelu(x)
+    y.backward(grad_output.float())
+    return x.grad.to(grad_output.dtype)
+""",
+        "saved_for_backward": ["x"],
         "tags": ["activation", "gpt", "bert"],
+    },
+    "silu": {
+        "category": OperatorCategory.ELEMENTWISE,
+        "description": "Sigmoid Linear Unit (SiLU/Swish) activation",
+        "inputs": [
+            {"name": "x", "shape": ["batch", "seq_len", "hidden"], "dtype": DataType.FP16},
+        ],
+        "outputs": [
+            {"name": "y", "shape": ["batch", "seq_len", "hidden"], "dtype": DataType.FP16},
+        ],
+        "math_description": "y = x * sigmoid(x) = x / (1 + exp(-x))",
+        "flops_formula": "4 * batch * seq_len * hidden",
+        "memory_reads_formula": "batch * seq_len * hidden",
+        "memory_writes_formula": "batch * seq_len * hidden",
+        "reference_impl": """
+import torch
+def silu_ref(x):
+    return torch.nn.functional.silu(x)
+""",
+        "backward_math_description": "sig = sigmoid(x); grad_x = grad_y * sig * (1 + x * (1 - sig))",
+        "backward_reference_impl": """
+import torch
+def silu_backward(grad_output, x):
+    sig = torch.sigmoid(x.float())
+    return (grad_output.float() * sig * (1.0 + x.float() * (1.0 - sig))).to(grad_output.dtype)
+""",
+        "saved_for_backward": ["x"],
+        "tags": ["activation", "swish", "llama", "qwen"],
+    },
+    "matmul": {
+        "category": OperatorCategory.MATMUL,
+        "description": "General matrix multiplication (GEMM)",
+        "inputs": [
+            {"name": "A", "shape": ["batch", "M", "K"], "dtype": DataType.FP16},
+            {"name": "B", "shape": ["batch", "K", "N"], "dtype": DataType.FP16},
+        ],
+        "outputs": [
+            {"name": "C", "shape": ["batch", "M", "N"], "dtype": DataType.FP16},
+        ],
+        "math_description": "C = A @ B (batched matrix multiplication)",
+        "flops_formula": "2 * batch * M * N * K",
+        "memory_reads_formula": "batch * (M * K + K * N)",
+        "memory_writes_formula": "batch * M * N",
+        "reference_impl": """
+import torch
+def matmul_ref(A, B):
+    return torch.matmul(A, B)
+""",
+        "backward_math_description": "grad_A = grad_C @ B^T; grad_B = A^T @ grad_C",
+        "backward_reference_impl": """
+import torch
+def matmul_backward(grad_output, A, B):
+    grad_A = torch.matmul(grad_output, B.transpose(-2, -1))
+    grad_B = torch.matmul(A.transpose(-2, -1), grad_output)
+    return grad_A, grad_B
+""",
+        "saved_for_backward": ["A", "B"],
+        "tags": ["matmul", "gemm", "linear"],
+    },
+    "softmax": {
+        "category": OperatorCategory.REDUCTION,
+        "description": "Softmax normalization along last dimension",
+        "inputs": [
+            {"name": "x", "shape": ["batch", "seq_len", "hidden"], "dtype": DataType.FP16},
+        ],
+        "outputs": [
+            {"name": "y", "shape": ["batch", "seq_len", "hidden"], "dtype": DataType.FP16},
+        ],
+        "math_description": "y_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))",
+        "flops_formula": "5 * batch * seq_len * hidden",
+        "memory_reads_formula": "batch * seq_len * hidden",
+        "memory_writes_formula": "batch * seq_len * hidden",
+        "reference_impl": """
+import torch
+def softmax_ref(x):
+    return torch.nn.functional.softmax(x, dim=-1)
+""",
+        "backward_math_description": "grad_x = y * (grad_y - (grad_y * y).sum(dim=-1, keepdim=True))",
+        "backward_reference_impl": """
+import torch
+def softmax_backward(grad_output, y):
+    # y is the forward output (saved for backward)
+    return y * (grad_output - (grad_output * y).sum(dim=-1, keepdim=True))
+""",
+        "saved_for_backward": ["y"],  # 注意: softmax 保存的是 output 而非 input
+        "tags": ["reduction", "softmax", "attention"],
     },
     "fused_moe": {
         "category": OperatorCategory.FUSED,
@@ -102,6 +227,22 @@ def gelu_ref(x):
         "flops_formula": "2 * top_k * batch * seq_len * hidden * intermediate",
         "memory_reads_formula": "top_k * batch * seq_len * hidden + num_experts * intermediate * hidden",
         "memory_writes_formula": "batch * seq_len * hidden",
+        "backward_math_description": "For each selected expert i: grad_w1_i = gate_i * x^T @ grad_intermediate; grad_w2_i = gate_i * intermediate^T @ grad_hidden; grad_x = sum(gate_i * grad_intermediate @ w1_i); grad_gate_i = (expert_output_i * grad_output).sum()",
+        "backward_reference_impl": """
+import torch
+def fused_moe_backward(grad_output, hidden_states, router_logits, w1, w2, top_k=2):
+    # Simplified: gradient flows through top-k selected experts
+    scores = torch.softmax(router_logits, dim=-1)
+    topk_scores, topk_idx = scores.topk(top_k, dim=-1)
+    # Each expert's backward is a standard linear backward
+    grad_hidden = torch.zeros_like(hidden_states)
+    for k in range(top_k):
+        expert_idx = topk_idx[..., k]  # which expert
+        gate = topk_scores[..., k:k+1]
+        grad_hidden += gate * grad_output  # simplified
+    return grad_hidden
+""",
+        "saved_for_backward": ["hidden_states", "router_logits", "w1", "w2"],
         "tags": ["moe", "mixtral", "expert_parallel"],
     },
 }
@@ -204,8 +345,14 @@ class OperatorSpecAgent(BaseAgent):
             "attention": "flash_attention",
             "rmsnorm": "rmsnorm",
             "rms norm": "rmsnorm",
-            "layer norm": "rmsnorm",
+            "rms_norm": "rmsnorm",
+            "silu": "silu",
+            "swish": "silu",
+            "swiglu": "silu",
             "gelu": "gelu",
+            "matmul": "matmul",
+            "gemm": "matmul",
+            "softmax": "softmax",
             "moe": "fused_moe",
             "mixture of experts": "fused_moe",
         }
@@ -245,6 +392,9 @@ class OperatorSpecAgent(BaseAgent):
             outputs=outputs,
             math_description=template.get("math_description", ""),
             reference_impl=template.get("reference_impl", ""),
+            backward_math_description=template.get("backward_math_description", ""),
+            backward_reference_impl=template.get("backward_reference_impl", ""),
+            saved_for_backward=template.get("saved_for_backward", []),
             flops_formula=template.get("flops_formula", ""),
             memory_reads_formula=template.get("memory_reads_formula", ""),
             memory_writes_formula=template.get("memory_writes_formula", ""),
