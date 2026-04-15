@@ -430,18 +430,129 @@ Backward 参考实现（PyTorch）：
 {forward_section}
 
 要求：
-1. 输入为 grad_output + saved_for_backward 中的张量
-2. 输出为每个 forward input 的梯度 (grad_input)
-3. 使用 float 精度做中间计算（输入输出可以是 half）
+1. 输入为 grad_output + saved_for_backward 中的张量（均为 half*）
+2. 输出为每个 forward input 的梯度 (grad_input)，**必须输出为 float32（float*）**，
+   避免 fp16 训练时梯度值超过 65504 导致 overflow → NaN
+3. 内核内部全程使用 float 精度计算
 4. 处理边界条件，确保 idx < N
 5. 不要使用 atomicAdd（除非规约操作必须使用）
 6. kernel 函数命名为 {op_ir.name}_backward_kernel
 
 {_get_cuda_forbidden()}
 
+【极其重要】kernel_code 必须在最后包含 extern "C" launcher 函数，这是 ctypes 加载的唯一入口。
+对于 elementwise backward（如 silu、gelu），launcher 签名必须严格为：
+```cpp
+extern "C" void launch_kernel(void* grad_out, void* x, void* grad_in_fp32, int N) {{
+    const half* g_ptr = reinterpret_cast<const half*>(grad_out);
+    const half* x_ptr = reinterpret_cast<const half*>(x);
+    float* gi_ptr = reinterpret_cast<float*>(grad_in_fp32);  // 输出为 float32！
+    int block = 256;
+    int grid = (N + block - 1) / block;
+    {op_ir.name}_backward_kernel<<<grid, block>>>(g_ptr, x_ptr, gi_ptr, N);
+}}
+```
+注意：grad_in 输出必须是 float*（float32），而不是 half*。
+Python 端会负责将 float32 → half 的类型转换，这样可以彻底避免 fp16 overflow。
+不包含正确 launcher 的代码将无法被 ctypes 加载，导致功能完全失效。
+
 返回格式（JSON）：
 {{
-  "kernel_code": "完整的 CUDA C++ backward kernel 代码",
+  "kernel_code": "完整的 CUDA C++ backward kernel 代码（必须含 extern C launcher，grad_in 输出为 float*）",
+  "build_flags": ["-O3", "-arch=sm_{sm}"],
+  "optimizations": ["列出优化技术"]
+}}"""
+
+
+def build_cuda_rmsnorm_forward_prompt(op_ir: OperatorIR, gpu_spec: GPUSpec) -> str:
+    """构造 RMSNorm forward CUDA kernel 的生成 prompt（专用，接口与通用不同）"""
+    sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "89"
+    return f"""你是一位 CUDA 内核编程专家，请为 RMSNorm 生成高性能 forward kernel。
+
+目标 GPU: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
+显存带宽: {gpu_spec.memory.bandwidth_gbps} GB/s
+
+算子: RMSNorm
+数学定义: {op_ir.math_description}
+
+参考实现（PyTorch）：
+```python
+{op_ir.reference_impl}
+```
+
+要求：
+1. 输入：x (half*, N*H elements), weight (half*, H elements), out (half*, N*H elements)
+2. 参数：N = total_tokens (batch*seq_len), H = hidden_size, eps (float)
+3. 每个 block 处理一行（一个 token，H 个元素），使用 shared memory 做 reduction
+4. 内部用 float 精度计算方差和归一化，输入输出为 half
+5. 使用 warp reduce 优化 reduction 速度
+
+{_get_cuda_forbidden()}
+
+【极其重要】kernel_code 最后必须包含以下精确签名的 launcher：
+```cpp
+extern "C" void launch_kernel(void* x, void* weight, void* out, int N, int H, float eps) {{
+    const half* xp = reinterpret_cast<const half*>(x);
+    const half* wp = reinterpret_cast<const half*>(weight);
+    half* op = reinterpret_cast<half*>(out);
+    int block = min(H, 1024);
+    rmsnorm_forward_kernel<<<N, block, block * sizeof(float)>>>(xp, wp, op, H, eps);
+}}
+```
+
+返回格式（JSON）：
+{{
+  "kernel_code": "完整的 CUDA C++ RMSNorm forward 代码（必须含上述 extern C launcher）",
+  "build_flags": ["-O3", "-arch=sm_{sm}"],
+  "optimizations": ["列出优化技术"]
+}}"""
+
+
+def build_cuda_rmsnorm_backward_prompt(op_ir: OperatorIR, gpu_spec: GPUSpec, forward_code: str = "") -> str:
+    """构造 RMSNorm backward CUDA kernel 的生成 prompt"""
+    sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "89"
+    return f"""你是一位 CUDA 内核编程专家，请为 RMSNorm 生成 backward kernel。
+
+目标 GPU: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
+
+算子: RMSNorm Backward
+Forward 数学定义: {op_ir.math_description}
+Backward 数学定义: {op_ir.backward_math_description}
+
+Backward 参考实现（PyTorch）：
+```python
+{op_ir.backward_reference_impl}
+```
+
+要求：
+1. 输入：grad_out (half*, N*H), x (half*, N*H), weight (half*, H)
+2. 输出：**grad_x (float*, N*H)** — 必须是 float32，避免 fp16 overflow→NaN；grad_weight (float* 累加，长度 H)
+3. N = total_tokens, H = hidden_size, eps (float)
+4. 每个 block 处理一行，shared memory 做行内 reduction
+5. grad_weight 使用 atomicAdd 累加（多行共享同一个 weight）
+6. 全程 float 中间精度，grad_x 直接写入 float* 指针，不做 float→half 截断
+
+{_get_cuda_forbidden()}
+
+【极其重要】kernel_code 最后必须包含以下精确签名的 launcher：
+```cpp
+extern "C" void launch_kernel(void* grad_out, void* x, void* weight,
+                               void* grad_x_fp32, void* grad_weight,
+                               int N, int H, float eps) {{
+    const half* go = reinterpret_cast<const half*>(grad_out);
+    const half* xp = reinterpret_cast<const half*>(x);
+    const half* wp = reinterpret_cast<const half*>(weight);
+    float* gx = reinterpret_cast<float*>(grad_x_fp32);  // 输出为 float32！
+    float* gw = reinterpret_cast<float*>(grad_weight);
+    int block = min(H, 1024);
+    rmsnorm_backward_kernel<<<N, block, 2 * block * sizeof(float)>>>(go, xp, wp, gx, gw, H, eps);
+}}
+```
+注意：grad_x 输出必须是 float*（float32），而不是 half*，防止梯度 fp16 overflow。
+
+返回格式（JSON）：
+{{
+  "kernel_code": "完整的 CUDA C++ RMSNorm backward 代码（必须含上述 extern C launcher，grad_x 为 float*）",
   "build_flags": ["-O3", "-arch=sm_{sm}"],
   "optimizations": ["列出优化技术"]
 }}"""

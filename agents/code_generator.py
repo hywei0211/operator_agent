@@ -17,6 +17,8 @@ from prompts.code_gen_prompts import (
     build_ascendc_codegen_prompt,
     build_cuda_backward_prompt,
     build_ascendc_backward_prompt,
+    build_cuda_rmsnorm_forward_prompt,
+    build_cuda_rmsnorm_backward_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,21 +134,25 @@ class CodeGenAgent(BaseAgent):
                 # 其他后端：用 CUDA backward prompt 做通用模板
                 prompt = build_cuda_backward_prompt(operator_ir, gpu_spec, forward_code)
 
+            # 支持 fix_context（retry 机制：编译失败后把 stderr 传回来重新生成）
+            fix_context = context.get_artifact("fix_context")
+            if fix_context and self.llm_client:
+                history = fix_context.get("history_summary", "")
+                guidance = fix_context.get("fix_guidance", "")
+                if history:
+                    prompt += f"\n\n--- PREVIOUS ATTEMPTS (避免重复错误) ---\n{history}\n"
+                if guidance:
+                    prompt += f"\n当前需修复的问题：\n{guidance}\n"
+
             if self.llm_client:
                 response = await self.call_llm(prompt, max_tokens=8192)
                 backward_kernel = self._parse_kernel_response(
                     response, f"{operator_ir.name}_backward",
                     backend.value, gpu_spec.model_name)
             else:
-                # 无 LLM: 生成占位模板
-                backward_kernel = GeneratedKernel(
-                    operator_name=f"{operator_ir.name}_backward",
-                    backend=backend.value,
-                    target_gpu=gpu_spec.model_name,
-                    source_code=f"// TODO: backward kernel for {operator_ir.name}\n"
-                                f"// Math: {operator_ir.backward_math_description}\n",
-                    build_flags=["-O3"],
-                )
+                # 无 LLM: 生成真实 backward 模板（含 launch_kernel 接口）
+                backward_kernel = self._generate_cuda_backward_template(
+                    operator_ir, gpu_spec)
 
             logger.info(f"[CodeGen] Backward kernel generated: {len(backward_kernel.source_code)} chars")
 
@@ -162,6 +168,83 @@ class CodeGenAgent(BaseAgent):
         except Exception as e:
             self.set_status(AgentStatus.FAILED)
             return self.failure_result(str(e))
+
+    # ── RMSNorm 专用生成方法 ──────────────────────────────────────
+
+    async def generate_rmsnorm_forward(self, context: AgentContext, **kwargs) -> AgentResult:
+        """
+        生成 RMSNorm forward kernel（专用接口，launcher 签名与通用 SiLU 不同）。
+        需要: operator_ir (rmsnorm)、gpu_spec
+        """
+        self._start_timer()
+        self.set_status(AgentStatus.RUNNING)
+
+        operator_ir: Optional[OperatorIR] = kwargs.get("operator_ir")
+        gpu_spec: Optional[GPUSpec] = kwargs.get("gpu_spec")
+
+        if operator_ir is None or gpu_spec is None:
+            return self.failure_result("operator_ir and gpu_spec required")
+
+        try:
+            sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "89"
+            if self.llm_client:
+                prompt = build_cuda_rmsnorm_forward_prompt(operator_ir, gpu_spec)
+                # 支持 fix_context（retry 机制）
+                fix_context = context.get_artifact("fix_context")
+                if fix_context:
+                    history = fix_context.get("history_summary", "")
+                    guidance = fix_context.get("fix_guidance", "")
+                    if history:
+                        prompt += f"\n\n--- PREVIOUS ATTEMPTS (避免重复错误) ---\n{history}\n"
+                    if guidance:
+                        prompt += f"\n当前需修复的问题：\n{guidance}\n"
+                response = await self.call_llm(prompt, max_tokens=8192)
+                kernel = self._parse_kernel_response(response, "rmsnorm_forward", "cuda", gpu_spec.model_name)
+            else:
+                kernel = self._generate_rmsnorm_forward_template(operator_ir, gpu_spec)
+
+            logger.info(f"[CodeGen] RMSNorm forward kernel: {len(kernel.source_code)} chars")
+            return self.success_result(output=kernel,
+                                       metrics={"code_length": len(kernel.source_code), "type": "rmsnorm_forward"})
+        except Exception as e:
+            self.set_status(AgentStatus.FAILED)
+            return self.failure_result(str(e))
+
+    async def generate_rmsnorm_backward(self, context: AgentContext, **kwargs) -> AgentResult:
+        """生成 RMSNorm backward kernel"""
+        self._start_timer()
+        self.set_status(AgentStatus.RUNNING)
+
+        operator_ir: Optional[OperatorIR] = kwargs.get("operator_ir")
+        gpu_spec: Optional[GPUSpec] = kwargs.get("gpu_spec")
+        forward_kernel: Optional[GeneratedKernel] = kwargs.get("forward_kernel")
+
+        if operator_ir is None or gpu_spec is None:
+            return self.failure_result("operator_ir and gpu_spec required")
+
+        try:
+            forward_code = forward_kernel.source_code if forward_kernel else ""
+            if self.llm_client:
+                prompt = build_cuda_rmsnorm_backward_prompt(operator_ir, gpu_spec, forward_code)
+                # 支持 fix_context（retry 机制）
+                fix_context = context.get_artifact("fix_context")
+                if fix_context:
+                    history = fix_context.get("history_summary", "")
+                    guidance = fix_context.get("fix_guidance", "")
+                    if history:
+                        prompt += f"\n\n--- PREVIOUS ATTEMPTS (避免重复错误) ---\n{history}\n"
+                    if guidance:
+                        prompt += f"\n当前需修复的问题：\n{guidance}\n"
+                response = await self.call_llm(prompt, max_tokens=8192)
+                kernel = self._parse_kernel_response(response, "rmsnorm_backward", "cuda", gpu_spec.model_name)
+            else:
+                kernel = self._generate_rmsnorm_backward_template(operator_ir, gpu_spec)
+
+            logger.info(f"[CodeGen] RMSNorm backward kernel: {len(kernel.source_code)} chars")
+            return self.success_result(output=kernel,
+                                       metrics={"code_length": len(kernel.source_code), "type": "rmsnorm_backward"})
+        except Exception as e:
+            self.set_status(AgentStatus.FAILED)
             return self.failure_result(str(e))
 
     def _select_backend(self, gpu_spec: GPUSpec) -> GPUBackend:
@@ -440,31 +523,72 @@ class CodeGenAgent(BaseAgent):
     # ---- 无LLM时的模板兜底实现 ----
 
     def _generate_cuda_template(self, op_ir: OperatorIR, gpu_spec: GPUSpec) -> GeneratedKernel:
-        """无LLM时生成CUDA模板代码"""
-        sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "80"
-        code = f"""// Auto-generated CUDA kernel for {op_ir.name}
+        """无LLM时生成CUDA模板代码（含正确的 launch_kernel 接口供 ctypes 调用）"""
+        sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "89"
+
+        # 针对 silu 算子生成真正可用的 forward kernel
+        if op_ir.name.lower() == "silu":
+            code = f"""// Auto-generated CUDA kernel for {op_ir.name}
+// Target: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
+// Math: {op_ir.math_description}
+// Forward: silu(x) = x * sigmoid(x)
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void silu_forward_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int N
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {{
+        float v = x[idx];
+        out[idx] = v / (1.0f + expf(-v));
+    }}
+}}
+
+// ctypes 调用接口: launch_kernel(input_ptr, output_ptr, N)
+extern "C" void launch_kernel(void* x, void* out, int N) {{
+    dim3 block(256);
+    dim3 grid((N + 255) / 256);
+    silu_forward_kernel<<<grid, block>>>(
+        reinterpret_cast<const float*>(x),
+        reinterpret_cast<float*>(out),
+        N
+    );
+}}
+"""
+        else:
+            code = f"""// Auto-generated CUDA kernel for {op_ir.name}
 // Target: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
 // Math: {op_ir.math_description}
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-// TODO: Implement {op_ir.name} kernel
 __global__ void {op_ir.name}_kernel(
-    // inputs: {', '.join(t.name for t in op_ir.inputs)}
-    // outputs: {', '.join(t.name for t in op_ir.outputs)}
+    const float* __restrict__ x,
+    float* __restrict__ out,
     int N
 ) {{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {{
-        // Implement: {op_ir.math_description}
+        // TODO: Implement {op_ir.math_description}
+        out[idx] = x[idx];
     }}
 }}
 
-void launch_{op_ir.name}(/* params */, cudaStream_t stream = nullptr) {{
+// ctypes 调用接口: launch_kernel(input_ptr, output_ptr, N)
+extern "C" void launch_kernel(void* x, void* out, int N) {{
     dim3 block(256);
     dim3 grid((N + 255) / 256);
-    {op_ir.name}_kernel<<<grid, block, 0, stream>>>(/* args */);
+    {op_ir.name}_kernel<<<grid, block>>>(
+        reinterpret_cast<const float*>(x),
+        reinterpret_cast<float*>(out),
+        N
+    );
 }}
 """
         return GeneratedKernel(
@@ -472,7 +596,254 @@ void launch_{op_ir.name}(/* params */, cudaStream_t stream = nullptr) {{
             backend="cuda",
             target_gpu=gpu_spec.model_name,
             source_code=code,
-            build_flags=[f"-arch=sm_{sm}", "-O3", "-use_fast_math"],
+            build_flags=[f"-arch=sm_{sm}", "-O3", "--use_fast_math"],
+            launch_config={"block_size": 256},
+        )
+
+    def _generate_cuda_backward_template(self, op_ir: OperatorIR, gpu_spec: GPUSpec) -> GeneratedKernel:
+        """无LLM时生成 silu backward 模板（含正确的 launch_kernel 接口）"""
+        sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "89"
+
+        if op_ir.name.lower() == "silu":
+            code = f"""// Auto-generated CUDA backward kernel for silu
+// Target: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
+// Backward: grad_x = grad_out * sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void silu_backward_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ x,
+    float* __restrict__ grad_in,
+    int N
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {{
+        float xi = x[idx];
+        float sig = 1.0f / (1.0f + expf(-xi));
+        grad_in[idx] = grad_out[idx] * sig * (1.0f + xi * (1.0f - sig));
+    }}
+}}
+
+// ctypes 调用接口: launch_kernel(grad_out_ptr, x_ptr, grad_in_ptr, N)
+extern "C" void launch_kernel(void* grad_out, void* x, void* grad_in, int N) {{
+    dim3 block(256);
+    dim3 grid((N + 255) / 256);
+    silu_backward_kernel<<<grid, block>>>(
+        reinterpret_cast<const float*>(grad_out),
+        reinterpret_cast<const float*>(x),
+        reinterpret_cast<float*>(grad_in),
+        N
+    );
+}}
+"""
+        else:
+            code = f"""// Auto-generated CUDA backward kernel for {op_ir.name}
+// Target: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
+// Math: {op_ir.backward_math_description}
+
+#include <cuda_runtime.h>
+
+__global__ void {op_ir.name}_backward_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ x,
+    float* __restrict__ grad_in,
+    int N
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {{
+        // TODO: implement backward for {op_ir.math_description}
+        grad_in[idx] = grad_out[idx];
+    }}
+}}
+
+// ctypes 调用接口: launch_kernel(grad_out_ptr, x_ptr, grad_in_ptr, N)
+extern "C" void launch_kernel(void* grad_out, void* x, void* grad_in, int N) {{
+    dim3 block(256);
+    dim3 grid((N + 255) / 256);
+    {op_ir.name}_backward_kernel<<<grid, block>>>(
+        reinterpret_cast<const float*>(grad_out),
+        reinterpret_cast<const float*>(x),
+        reinterpret_cast<float*>(grad_in),
+        N
+    );
+}}
+"""
+        return GeneratedKernel(
+            operator_name=f"{op_ir.name}_backward",
+            backend="cuda",
+            target_gpu=gpu_spec.model_name,
+            source_code=code,
+            build_flags=[f"-arch=sm_{sm}", "-O3", "--use_fast_math"],
+            launch_config={"block_size": 256},
+        )
+
+    def _generate_rmsnorm_forward_template(self, op_ir: OperatorIR, gpu_spec: GPUSpec) -> GeneratedKernel:
+        """无 LLM 时生成 RMSNorm forward 模板（含正确的 launch_kernel 接口）"""
+        sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "89"
+        code = f"""// Auto-generated CUDA RMSNorm forward kernel
+// Target: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
+// Math: {op_ir.math_description}
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Each block handles one token (one row of H elements)
+__global__ void rmsnorm_forward_kernel(
+    const half* __restrict__ x,
+    const half* __restrict__ weight,
+    half* __restrict__ out,
+    int H,
+    float eps
+) {{
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+    int row = blockIdx.x;
+
+    // Load row into shared mem as float, compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = tid; i < H; i += blockDim.x) {{
+        float v = __half2float(x[row * H + i]);
+        smem[i] = v;
+        sum_sq += v * v;
+    }}
+    __syncthreads();
+
+    // Block-level reduction for sum_sq
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {{
+        if (tid < stride) {{
+            // Use last H positions of smem as scratch for reduction
+        }}
+        __syncthreads();
+    }}
+
+    // Simple sequential reduction by thread 0 (safe for correctness)
+    if (tid == 0) {{
+        float total = 0.0f;
+        for (int i = 0; i < H; i++) total += smem[i] * smem[i];
+        smem[H] = rsqrtf(total / H + eps);  // rms_inv stored at smem[H]
+    }}
+    __syncthreads();
+
+    float rms_inv = smem[H];
+    for (int i = tid; i < H; i += blockDim.x) {{
+        float normed = smem[i] * rms_inv;
+        float w = __half2float(weight[i]);
+        out[row * H + i] = __float2half(normed * w);
+    }}
+}}
+
+// ctypes 调用接口: launch_kernel(x, weight, out, N, H, eps)
+extern "C" void launch_kernel(void* x, void* weight, void* out, int N, int H, float eps) {{
+    const half* xp = reinterpret_cast<const half*>(x);
+    const half* wp = reinterpret_cast<const half*>(weight);
+    half* op = reinterpret_cast<half*>(out);
+    int block = min(H, 256);
+    int smem = (H + 1) * sizeof(float);
+    rmsnorm_forward_kernel<<<N, block, smem>>>(xp, wp, op, H, eps);
+}}
+"""
+        return GeneratedKernel(
+            operator_name="rmsnorm_forward",
+            backend="cuda",
+            target_gpu=gpu_spec.model_name,
+            source_code=code,
+            build_flags=[f"-arch=sm_{sm}", "-O3", "--use_fast_math"],
+            launch_config={"block_size": 256},
+        )
+
+    def _generate_rmsnorm_backward_template(self, op_ir: OperatorIR, gpu_spec: GPUSpec) -> GeneratedKernel:
+        """无 LLM 时生成 RMSNorm backward 模板（grad_x 输出 float32，避免 fp16 overflow）"""
+        sm = gpu_spec.compute_capability.replace('.', '') if gpu_spec.compute_capability else "89"
+        code = f"""// Auto-generated CUDA RMSNorm backward kernel
+// Target: {gpu_spec.model_name} (SM {gpu_spec.compute_capability})
+// Backward: grad_x = weight/rms*(grad_y - x_norm*mean(grad_y*x_norm,dim=-1))
+// NOTE: grad_x 输出为 float32（避免 fp16 overflow 导致训练 NaN）
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Each block handles one token (row)
+__global__ void rmsnorm_backward_kernel(
+    const half* __restrict__ grad_out,
+    const half* __restrict__ x,
+    const half* __restrict__ weight,
+    float* __restrict__ grad_x,         // float* 而非 half*
+    float* __restrict__ grad_weight,
+    int H,
+    float eps
+) {{
+    extern __shared__ float smem[];
+    float* sx = smem;
+    float* sgo = smem + H;
+
+    int tid = threadIdx.x;
+    int row = blockIdx.x;
+
+    for (int i = tid; i < H; i += blockDim.x) {{
+        sx[i]  = __half2float(x[row * H + i]);
+        sgo[i] = __half2float(grad_out[row * H + i]);
+    }}
+    __syncthreads();
+
+    if (tid == 0) {{
+        float sum_sq = 0.0f;
+        for (int i = 0; i < H; i++) sum_sq += sx[i] * sx[i];
+        smem[2*H] = rsqrtf(sum_sq / H + eps);
+    }}
+    __syncthreads();
+
+    float rms_inv = smem[2*H];
+
+    if (tid == 0) {{
+        // dot = mean(go * x * w)，注意：这里 x 是原始输入（非 x_norm！）
+        // 最终公式: gx = (go*w - x_norm*dot) * rms_inv
+        float dot = 0.0f;
+        for (int i = 0; i < H; i++) {{
+            float wi = __half2float(weight[i]);
+            dot += sgo[i] * sx[i] * wi;  // mean(go * x * w)，不含 rms_inv
+        }}
+        smem[2*H+1] = dot / H;
+    }}
+    __syncthreads();
+
+    float dot_mean = smem[2*H+1];
+
+    for (int i = tid; i < H; i += blockDim.x) {{
+        float wi = __half2float(weight[i]);
+        float x_norm_i = sx[i] * rms_inv;
+        // 正确公式（等价于 PyTorch: (go*w - x_norm * mean(go*x*w)) * rms_inv）:
+        // gx = wi * sgo[i] * rms_inv - x_norm_i * dot_mean * rms_inv
+        //    = (wi * sgo[i] - x_norm_i * dot_mean) * rms_inv
+        float gx_i = (wi * sgo[i] - x_norm_i * dot_mean) * rms_inv;
+        grad_x[row * H + i] = gx_i;   // 直接写 float，不截断为 half
+        atomicAdd(&grad_weight[i], sgo[i] * x_norm_i);
+    }}
+}}
+
+// ctypes 调用接口: launch_kernel(grad_out, x, weight, grad_x_fp32, grad_weight, N, H, eps)
+extern "C" void launch_kernel(void* grad_out, void* x, void* weight,
+                               void* grad_x_fp32, void* grad_weight,
+                               int N, int H, float eps) {{
+    const half* go = reinterpret_cast<const half*>(grad_out);
+    const half* xp = reinterpret_cast<const half*>(x);
+    const half* wp = reinterpret_cast<const half*>(weight);
+    float* gx = reinterpret_cast<float*>(grad_x_fp32);  // float* 输出
+    float* gw = reinterpret_cast<float*>(grad_weight);
+    int block = min(H, 256);
+    int smem = (2 * H + 2) * sizeof(float);
+    rmsnorm_backward_kernel<<<N, block, smem>>>(go, xp, wp, gx, gw, H, eps);
+}}
+"""
+        return GeneratedKernel(
+            operator_name="rmsnorm_backward",
+            backend="cuda",
+            target_gpu=gpu_spec.model_name,
+            source_code=code,
+            build_flags=[f"-arch=sm_{sm}", "-O3", "--use_fast_math"],
             launch_config={"block_size": 256},
         )
 

@@ -1,9 +1,31 @@
+# Python 缓存
 __pycache__/
 *.pyc
 *.pyo
+
+# 环境和密钥（绝对不上传）
 .env
-output/
-logs/
-*.tar.gz
+
+# 编译产物（.so/.o 不上传，.cu/.cpp 源码保留）
 *.so
 *.o
+
+# output/：保留 .cu/.cpp 源码，忽略编译产物和日志
+output/**/*.so
+output/**/*.o
+output/qwen_lora/
+output/hetero_results/phase1_*.json
+
+# Slurm 日志
+logs/
+
+# 压缩包
+*.tar.gz
+
+# Claude IDE 配置（含操作历史，不上传）
+.claude/
+
+# 数据库和缓存（运行时生成，不上传）
+.llm_cache.db*
+.operator_registry.db
+*.json.bak

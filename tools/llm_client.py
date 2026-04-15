@@ -526,15 +526,225 @@ __global__ void matmul_kernel(
                 return response
 
         # 按算子 + 后端匹配内置模板
+        # 注意：先判断 backward，避免 silu/gelu backward prompt 被误判为 forward 模板
+        is_rmsnorm = any(k in user_lower for k in ("rmsnorm", "rms_norm", "rms norm"))
+        is_backward = "backward" in user_lower or "grad_output" in user_lower
+
+        # RMSNorm forward/backward（_TEMPLATES 里的 rmsnorm 没有 launcher，走专用逻辑）
+        if is_rmsnorm and is_backward:
+            return self._wrap_response(self._rmsnorm_backward_template(), "rmsnorm_backward", "cuda")
+        elif is_rmsnorm:
+            return self._wrap_response(self._rmsnorm_forward_template(), "rmsnorm_forward", "cuda")
+
+        # SiLU/GeLU backward
+        if is_backward:
+            op = "silu" if "silu" in user_lower else ("gelu" if "gelu" in user_lower else "elementwise")
+            return self._wrap_response(self._elementwise_backward_template(op), f"{op}_backward", "cuda")
+
+        # 其余 forward：走 _TEMPLATES（silu、gelu、flash_attention 等）
         for op_name, backends in self._TEMPLATES.items():
             if op_name in user_lower:
+                # rmsnorm 已在上面处理，这里不重复
+                if op_name == "rmsnorm":
+                    continue
                 for backend, code in backends.items():
                     if backend in user_lower or backend == "cuda":
                         return self._wrap_response(code, op_name, backend)
 
-        # 通用 fallback
+        # 通用 forward fallback
         backend = "ascendc" if "ascendc" in user_lower else "cuda"
-        return self._wrap_response(self._generic_template(backend), "custom_operator", backend)
+        op = "silu" if "silu" in user_lower else ("gelu" if "gelu" in user_lower else "custom_operator")
+        return self._wrap_response(self._elementwise_forward_template(op), op, backend)
+
+    def _elementwise_forward_template(self, op_name: str) -> str:
+        if "silu" in op_name:
+            impl = "float v = xi / (1.0f + expf(-xi));"
+        elif "gelu" in op_name:
+            impl = "float v = 0.5f * xi * (1.0f + tanhf(0.7978845608f * (xi + 0.044715f * xi*xi*xi)));"
+        else:
+            impl = "float v = xi;"
+        return f'''```cuda
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void {op_name}_forward_kernel(const half* __restrict__ x, half* __restrict__ out, int N) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {{
+        float xi = __half2float(x[idx]);
+        {impl}
+        out[idx] = __float2half(v);
+    }}
+}}
+
+extern "C" void launch_kernel(void* x, void* out, int N) {{
+    int block = 256;
+    int grid = (N + block - 1) / block;
+    {op_name}_forward_kernel<<<grid, block>>>(
+        reinterpret_cast<const half*>(x),
+        reinterpret_cast<half*>(out),
+        N);
+}}
+```'''
+
+    def _elementwise_backward_template(self, op_name: str) -> str:
+        if "silu" in op_name:
+            grad_impl = ("float sig = 1.0f / (1.0f + expf(-xi));\n"
+                        "        float gx = go * sig * (1.0f + xi * (1.0f - sig));")
+        elif "gelu" in op_name:
+            grad_impl = ("float inner = 0.7978845608f * (xi + 0.044715f * xi*xi*xi);\n"
+                        "        float cdf = 0.5f * (1.0f + tanhf(inner));\n"
+                        "        float pdf = 0.7978845608f * (1.0f + 3.0f*0.044715f*xi*xi) / (coshf(inner)*coshf(inner));\n"
+                        "        float gx = go * (cdf + xi * pdf);")
+        else:
+            grad_impl = "float gx = go;"
+        return f'''```cuda
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// grad_in 输出为 float32，避免 fp16 overflow 导致训练 NaN
+__global__ void {op_name}_backward_kernel(
+    const half* __restrict__ grad_out,
+    const half* __restrict__ x,
+    float* __restrict__ grad_in,   // float* 而非 half*
+    int N
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {{
+        float go = __half2float(grad_out[idx]);
+        float xi = __half2float(x[idx]);
+        {grad_impl}
+        grad_in[idx] = gx;   // 直接写 float，不做 float->half 截断
+    }}
+}}
+
+// launcher：grad_in_fp32 指向 float32 buffer
+extern "C" void launch_kernel(void* grad_out, void* x, void* grad_in_fp32, int N) {{
+    int block = 256;
+    int grid = (N + block - 1) / block;
+    {op_name}_backward_kernel<<<grid, block>>>(
+        reinterpret_cast<const half*>(grad_out),
+        reinterpret_cast<const half*>(x),
+        reinterpret_cast<float*>(grad_in_fp32),   // float* 输出
+        N);
+}}
+```'''
+
+    def _rmsnorm_forward_template(self) -> str:
+        return '''```cuda
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void rmsnorm_forward_kernel(
+    const half* __restrict__ x,
+    const half* __restrict__ weight,
+    half* __restrict__ out,
+    int H, float eps
+) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < H; i += blockDim.x) {
+        float v = __half2float(x[row * H + i]);
+        smem[i] = v;
+        sum_sq += v * v;
+    }
+    __syncthreads();
+    // Sequential reduction by thread 0
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < H; i++) total += smem[i] * smem[i];
+        smem[H] = rsqrtf(total / H + eps);
+    }
+    __syncthreads();
+    float rms_inv = smem[H];
+    for (int i = tid; i < H; i += blockDim.x) {
+        out[row * H + i] = __float2half(smem[i] * rms_inv * __half2float(weight[i]));
+    }
+}
+
+extern "C" void launch_kernel(void* x, void* weight, void* out, int N, int H, float eps) {
+    int block = min(H, 256);
+    int smem = (H + 1) * sizeof(float);
+    rmsnorm_forward_kernel<<<N, block, smem>>>(
+        reinterpret_cast<const half*>(x),
+        reinterpret_cast<const half*>(weight),
+        reinterpret_cast<half*>(out),
+        H, eps);
+}
+```'''
+
+    def _rmsnorm_backward_template(self) -> str:
+        return '''```cuda
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// grad_x 输出为 float32，避免 fp16 overflow 导致训练 NaN
+__global__ void rmsnorm_backward_kernel(
+    const half* __restrict__ grad_out,
+    const half* __restrict__ x,
+    const half* __restrict__ weight,
+    float* __restrict__ grad_x,       // float* 而非 half*
+    float* __restrict__ grad_weight,
+    int H, float eps
+) {
+    extern __shared__ float smem[];
+    float* sx = smem;
+    float* sgo = smem + H;
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < H; i += blockDim.x) {
+        sx[i] = __half2float(x[row * H + i]);
+        sgo[i] = __half2float(grad_out[row * H + i]);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (int i = 0; i < H; i++) ss += sx[i] * sx[i];
+        float rms_inv = rsqrtf(ss / H + eps);
+        smem[2*H] = rms_inv;
+        // dot = mean(go * x * w)，注意 x 是原始输入（非 x_norm）
+        float dot = 0.0f;
+        for (int i = 0; i < H; i++)
+            dot += sgo[i] * sx[i] * __half2float(weight[i]);  // 不含 rms_inv
+        smem[2*H+1] = dot / H;
+    }
+    __syncthreads();
+
+    float rms_inv = smem[2*H];
+    float dot_mean = smem[2*H+1];
+    for (int i = tid; i < H; i += blockDim.x) {
+        float wi = __half2float(weight[i]);
+        float xn = sx[i] * rms_inv;
+        // 正确公式: (go*w - x_norm * mean(go*x*w)) * rms_inv
+        float gx = (wi * sgo[i] - xn * dot_mean) * rms_inv;
+        grad_x[row * H + i] = gx;   // 直接写 float，不做 float->half 截断
+        atomicAdd(&grad_weight[i], sgo[i] * xn);
+    }
+}
+
+// launcher：grad_x_fp32 指向 float32 buffer
+extern "C" void launch_kernel(void* grad_out, void* x, void* weight,
+                               void* grad_x_fp32, void* grad_weight,
+                               int N, int H, float eps) {
+    int block = min(H, 256);
+    int smem = (2 * H + 2) * sizeof(float);
+    rmsnorm_backward_kernel<<<N, block, smem>>>(
+        reinterpret_cast<const half*>(grad_out),
+        reinterpret_cast<const half*>(x),
+        reinterpret_cast<const half*>(weight),
+        reinterpret_cast<float*>(grad_x_fp32),   // float* 输出
+        reinterpret_cast<float*>(grad_weight),
+        H, eps);
+}
+```'''
 
     def _wrap_response(self, code: str, op_name: str, backend: str) -> str:
         return (

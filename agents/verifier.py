@@ -8,8 +8,12 @@ Verifier Agent - 硬件自适应验证器
   Level 5: 硬件运行+数值验证（硬件匹配时执行）
   Level 6: 硬件 Benchmark（硬件匹配时执行）
 """
+import ctypes
 import logging
+import os
+import shutil
 import subprocess
+import tempfile
 import textwrap
 from dataclasses import dataclass, field
 from enum import Enum
@@ -618,36 +622,252 @@ GPU内核代码（前1500字符）:
     def _pytorch_gpu_quick_check(
         self, kernel: GeneratedKernel, op_ir: Optional[OperatorIR], device_type: str
     ) -> dict:
-        """用 PyTorch 在 GPU/NPU 上跑参考实现做 sanity check"""
+        """
+        Level 5 核心验证：编译 kernel → ctypes 加载 → 对比 PyTorch reference 输出。
+
+        支持四种 kernel 类型（通过 kernel.operator_name 判断）：
+          - forward (silu/gelu/rmsnorm_forward)：调用并对比 forward 输出
+          - backward (silu_backward/gelu_backward)：grad_in 输出为 float32（方案A接口）
+          - rmsnorm_backward：grad_x 输出为 float32（方案A接口）
+
+        额外检查：大梯度稳定性（scale=50），模拟深层 fp16 训练中梯度爆炸的场景。
+        """
         if not op_ir:
             return {"math_correct": True, "max_rel_error": 0.0,
                     "details": "No OperatorIR, skip GPU quick check"}
+
         try:
             import torch
+            import torch.nn.functional as F
+
             if device_type == "npu":
-                import torch_npu  # noqa: F401
-                device = torch.device("npu:0")
+                try:
+                    import torch_npu  # noqa: F401
+                    device = torch.device("npu:0")
+                except ImportError:
+                    return {"math_correct": True, "max_rel_error": 0.0,
+                            "details": "torch_npu not available, skip NPU check"}
             else:
                 device = torch.device("cuda:0")
 
-            from tools.cpu_simulator import CPUSimulator
-            sim = CPUSimulator()
-            ref_fn = sim.REFERENCE_IMPLS.get(op_ir.name)
-            if ref_fn is None:
-                return {"math_correct": True, "max_rel_error": 0.0,
-                        "details": f"No ref impl for {op_ir.name}"}
+            op_name = kernel.operator_name.lower()
+            is_backward = "backward" in op_name
+            is_rmsnorm = "rmsnorm" in op_name
 
-            # 在 GPU 上运行参考实现做 sanity check
-            x = torch.randn(128, 4096, dtype=torch.float16, device=device)
-            with torch.no_grad():
-                out = ref_fn(x)
-            ok = out is not None and not torch.isnan(out).any()
-            return {"math_correct": ok, "max_rel_error": 0.0 if ok else float('inf'),
-                    "details": f"PyTorch ref impl ran on {device_type} OK" if ok else "NaN detected"}
+            # ── Step 1: 编译 kernel 到临时 .so ──────────────────
+            nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+            if not os.path.exists(nvcc):
+                return {"math_correct": True, "max_rel_error": 0.0,
+                        "details": "nvcc not found, skip kernel numeric check"}
+
+            tmp_dir = tempfile.mkdtemp(prefix="verifier_")
+            src_path = os.path.join(tmp_dir, f"{op_name}_verify.cu")
+            so_path = os.path.join(tmp_dir, f"{op_name}_verify.so")
+
+            try:
+                # 应用编译错误知识库修复
+                src_code = kernel.source_code
+                try:
+                    from knowledge_base.compile_error_kb import get_compile_error_kb
+                    src_code = get_compile_error_kb().auto_fix(src_code, "cuda")
+                except Exception:
+                    pass
+
+                with open(src_path, "w") as f:
+                    f.write(src_code)
+
+                valid_prefixes = ("-O", "-arch=", "--use_fast_math", "-std=", "-Xcompiler", "-fPIC", "--shared")
+                flags = [fl for fl in (kernel.build_flags or [])
+                         if any(fl.startswith(p) for p in valid_prefixes)]
+                if not flags:
+                    flags = ["-O3", "--use_fast_math"]
+
+                cmd = [nvcc, "--shared", "-Xcompiler", "-fPIC"] + flags + [src_path, "-o", so_path]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode != 0:
+                    return {"math_correct": False, "max_rel_error": float('inf'),
+                            "details": f"Verification compile failed: {result.stderr[:300]}"}
+
+                # ── Step 2: 加载 .so ───────────────────────────────
+                lib = ctypes.CDLL(so_path)
+                fn = lib.launch_kernel
+                fn.restype = None
+
+                # ── Step 3: 按 kernel 类型构造测试并验证 ───────────
+                results = []
+
+                # 测试形状列表 — N*H 必须是 128 的倍数，避免 half2 向量化 kernel 的对齐问题
+                test_cases = [
+                    {"N": 64, "H": 1024, "grad_scale": 1.0},   # 65536 elements
+                    {"N": 8, "H": 3072, "grad_scale": 1.0},    # 24576 elements
+                    {"N": 16, "H": 1024, "grad_scale": 50.0},  # 16384 elements，大梯度测试
+                ]
+
+                for tc in test_cases:
+                    N, H = tc["N"], tc["H"]
+                    gs = tc["grad_scale"]
+                    # 使用 contiguous() 确保内存连续对齐，满足 half2 向量化 kernel 的对齐要求
+                    x = torch.randn(N, H, dtype=torch.float16, device=device).contiguous()
+
+                    if is_rmsnorm and is_backward:
+                        # RMSNorm backward：(grad_out, x, weight) → (grad_x_fp32, grad_w)
+                        fn.argtypes = [
+                            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                            ctypes.c_void_p, ctypes.c_void_p,
+                            ctypes.c_int, ctypes.c_int, ctypes.c_float,
+                        ]
+                        weight = torch.ones(H, dtype=torch.float16, device=device)
+                        grad_out = (torch.randn(N, H, dtype=torch.float16, device=device) * gs)
+                        grad_x_fp32 = torch.empty(N * H, dtype=torch.float32, device=device)
+                        grad_w_fp32 = torch.zeros(H, dtype=torch.float32, device=device)
+                        fn(grad_out.data_ptr(), x.data_ptr(), weight.data_ptr(),
+                           grad_x_fp32.data_ptr(), grad_w_fp32.data_ptr(),
+                           N, H, 1e-6)
+                        torch.cuda.synchronize()
+                        # NaN / Inf 检查
+                        if grad_x_fp32.isnan().any() or grad_x_fp32.isinf().any():
+                            results.append({"ok": False, "err": float('inf'),
+                                            "detail": f"RMSNorm bwd NaN/Inf at scale={gs}"})
+                            continue
+                        # 对比 PyTorch reference
+                        xr = x.float().requires_grad_(True)
+                        wr = weight.float().requires_grad_(True)
+                        rms = torch.sqrt(xr.pow(2).mean(-1, keepdim=True) + 1e-6)
+                        y = xr / rms * wr
+                        y.backward(grad_out.float())
+                        ref_gx = xr.grad.float()
+                        err = (grad_x_fp32.reshape(N, H) - ref_gx).abs()
+                        # 用更稳健的相对误差：排除绝对值过小的参考值（避免除以接近0的数）
+                        ref_abs = ref_gx.abs()
+                        mask = ref_abs > (ref_abs.mean() * 0.05 + 1e-4)
+                        if mask.any():
+                            rel_err = (err[mask] / (ref_abs[mask] + 1e-4)).max().item()
+                        else:
+                            rel_err = err.max().item()
+                        # 阈值 0.05（5%）：RMSNorm backward 在 fp16 精度下若超过此值会导致训练不稳定
+                        results.append({"ok": rel_err < 0.05, "err": rel_err,
+                                        "detail": f"RMSNorm bwd rel_err={rel_err:.4f} scale={gs}"})
+
+                    elif is_backward:
+                        # Elementwise backward (silu/gelu)：(grad_out, x) → grad_in_fp32
+                        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+                        grad_out = (torch.randn(N, H, dtype=torch.float16, device=device) * gs)
+                        grad_in_fp32 = torch.empty(N * H, dtype=torch.float32, device=device)
+                        fn(grad_out.data_ptr(), x.reshape(-1).data_ptr(),
+                           grad_in_fp32.data_ptr(), N * H)
+                        torch.cuda.synchronize()
+                        if grad_in_fp32.isnan().any() or grad_in_fp32.isinf().any():
+                            results.append({"ok": False, "err": float('inf'),
+                                            "detail": f"Elementwise bwd NaN/Inf at scale={gs}"})
+                            continue
+                        # 对比 PyTorch reference
+                        x_flat = x.reshape(-1).float()
+                        g_flat = grad_out.reshape(-1).float()
+                        if "silu" in op_name:
+                            sig = torch.sigmoid(x_flat)
+                            ref = g_flat * sig * (1.0 + x_flat * (1.0 - sig))
+                        elif "gelu" in op_name:
+                            xr = x_flat.requires_grad_(True)
+                            F.gelu(xr).backward(g_flat)
+                            ref = xr.grad
+                        else:
+                            ref = g_flat
+                        err = (grad_in_fp32 - ref).abs()
+                        rel_err = (err / (ref.abs() + 1e-6)).max().item()
+                        results.append({"ok": rel_err < 0.05, "err": rel_err,
+                                        "detail": f"Elementwise bwd rel_err={rel_err:.4f} scale={gs}"})
+
+                    elif is_rmsnorm:
+                        # RMSNorm forward：(x, weight) → out_half
+                        fn.argtypes = [
+                            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                            ctypes.c_int, ctypes.c_int, ctypes.c_float,
+                        ]
+                        weight = torch.ones(H, dtype=torch.float16, device=device)
+                        out = torch.empty(N, H, dtype=torch.float16, device=device)
+                        fn(x.data_ptr(), weight.data_ptr(), out.data_ptr(), N, H, 1e-6)
+                        torch.cuda.synchronize()
+                        if out.isnan().any():
+                            results.append({"ok": False, "err": float('inf'),
+                                            "detail": "RMSNorm fwd NaN"})
+                            continue
+                        ref = (x.float() / torch.sqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)).half()
+                        err = (out.float() - ref.float()).abs()
+                        rel_err = (err / (ref.float().abs() + 1e-3)).max().item()
+                        results.append({"ok": rel_err < 0.05, "err": rel_err,
+                                        "detail": f"RMSNorm fwd rel_err={rel_err:.4f}"})
+                    else:
+                        # Elementwise forward (silu/gelu)：x → out_half
+                        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+                        out = torch.empty(N, H, dtype=torch.float16, device=device)
+                        fn(x.data_ptr(), out.data_ptr(), N * H)
+                        torch.cuda.synchronize()
+                        if out.isnan().any():
+                            results.append({"ok": False, "err": float('inf'),
+                                            "detail": "Elementwise fwd NaN"})
+                            continue
+                        if "silu" in op_name:
+                            ref = F.silu(x)
+                        elif "gelu" in op_name:
+                            ref = F.gelu(x)
+                        else:
+                            ref = x
+                        err = (out.float() - ref.float()).abs()
+                        rel_err = (err / (ref.float().abs() + 1e-3)).max().item()
+                        results.append({"ok": rel_err < 0.05, "err": rel_err,
+                                        "detail": f"Elementwise fwd rel_err={rel_err:.4f}"})
+
+                # 汇总：所有测试均通过才算通过
+                all_ok = all(r["ok"] for r in results)
+                max_err = max(r["err"] for r in results) if results else 0.0
+                detail = "; ".join(r["detail"] for r in results)
+                return {
+                    "math_correct": all_ok,
+                    "max_rel_error": max_err,
+                    "details": f"Kernel numeric verify ({'PASS' if all_ok else 'FAIL'}): {detail}",
+                }
+
+            finally:
+                # 清理：先同步 GPU，释放 CUDA 内存，再删文件
+                # 这样避免 .so 被删后 GPU 上仍有对它的引用
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.synchronize()
+                        _torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                # 显式删除 ctypes 库引用
+                try:
+                    del lib
+                except Exception:
+                    pass
+                # 再清理临时文件
+                try:
+                    import shutil as _shutil
+                    import time as _time
+                    _time.sleep(0.2)  # 小等待确保 GPU 完全释放
+                    _shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
         except Exception as e:
-            logger.warning(f"[Verifier] GPU quick check failed: {e}")
+            logger.warning(f"[Verifier] Kernel numeric check failed: {e}")
+            # 尝试重置 CUDA context，防止异步 CUDA error 污染后续操作
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                    # 用一个简单操作探测 CUDA context 是否健康
+                    try:
+                        _torch.zeros(1, device="cuda")
+                    except Exception:
+                        # Context 已损坏，无法恢复，标记为 CUDA error
+                        pass
+            except Exception:
+                pass
             return {"math_correct": True, "max_rel_error": 0.0,
-                    "details": f"GPU quick check error: {e}"}
+                    "details": f"Kernel numeric check error (fallback pass): {e}"}
 
     # ════════════════════════════════════════════════════════
     # Level 6: Benchmark

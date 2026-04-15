@@ -1,199 +1,100 @@
-# Operator Agent — 异构 GPU 算子自动生成系统
+# Operator Agent — 异构 GPU 算子自动生成 + 注入训练系统
 
-> 一句话解释：你告诉它"帮我写个 SiLU 算子，跑在昇腾 910B 上"，它就能自动生成、编译、验证一个高性能的 GPU 内核代码——包括前向和反向传播。
+> 给定一个训练任务，系统自动分析所需算子，调用 LLM 生成 CUDA kernel，编译验证后注入模型，完成端到端 LoRA 微调。
 
----
-
-## 这个项目是做什么的？
-
-在深度学习训练中，底层的计算单元叫做 **算子**（Operator）。比如 GELU 激活函数、矩阵乘法、注意力机制（Attention）等。这些算子通常需要针对不同的 GPU 硬件（NVIDIA、AMD、华为昇腾）手写高性能代码，这是一项非常专业且耗时的工作。
-
-本项目通过 **多个 AI Agent 协作** 的方式，自动完成这个过程：
-
-```
-你输入: "帮我生成一个 FlashAttention 算子，目标是 H100 和昇腾 910B"
-          ↓
-系统自动: 理解需求 → 分析硬件 → 生成 forward+backward 代码 → 编译 → 验证正确性 → 优化性能 → 存入仓库
-          ↓
-你得到: 针对两种 GPU 各自优化的高性能算子代码（可直接用于训练）
-```
-
-### 核心亮点
-
-- **多硬件支持**：一套系统同时生成 NVIDIA (CUDA)、AMD (HIP)、华为昇腾 (AscendC) 的代码
-- **前向+反向传播**：7 个核心算子同时生成 forward 和 backward kernel，自动生成 `torch.autograd.Function` 包装，可直接用于训练
-- **硬件自适应验证**：自动检测当前硬件，有 GPU 就做完整验证，没有就做静态分析+CPU 数学验证（6 级验证体系）
-- **全自动流水线**：从自然语言描述到可运行的 GPU 内核，全程无需人工介入
-- **自我修复**：编译失败时自动分析错误、修复代码、重试，并记录到知识库避免重复犯错
-- **LLM 响应缓存**：相同请求不重复调用 LLM，节省时间和费用
-- **断点续传**：ReviewLoop 验证过程支持断点恢复，crash 后不丢失进度
-- **算子仓库**：已验证的算子自动入库（含验证等级标注），下次直接复用
+[![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://www.python.org/) [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-orange)](https://pytorch.org/) [![CUDA](https://img.shields.io/badge/CUDA-12.x-green)](https://developer.nvidia.com/cuda-toolkit)
 
 ---
 
-## 已验证的能力
+## 已验证能力
 
-| 能力 | 说明 |
+| 能力 | 状态 |
 |------|------|
-| **CUDA 算子生成** | 输入算子名 → LLM 生成 CUDA kernel → nvcc 编译 → 数值验证 |
-| **AscendC 算子生成** | 输入算子名 → LLM 生成 AscendC kernel → torch_npu 验证 → NPU Benchmark |
-| **7 种核心算子** | gelu、silu、rmsnorm、flash_attention、matmul、softmax、fused_moe |
-| **前向+反向传播** | 7 个算子全部支持 backward，gradcheck 验证通过 |
-| **NPU 真机验证** | 昇腾 910B4 (CANN 8.3.RC1) 上 5/5 算子数值验证通过 |
-| **6 级验证体系** | 静态分析 → LLM 审查 → CPU 数学 → 编译 → 硬件运行 → Benchmark |
-| **编译错误自修复** | 37 条自动 patch 规则 + 动态学习新模式 |
-| **LLM 调用缓存** | SQLite 缓存，7 天过期，避免重复花钱 |
-| **CLI 工具** | 自然语言 + 仓库管理/搜索 + 知识库管理 + 交互模式 |
+| 训练代码静态分析，自动识别算子依赖 | ✅ |
+| LLM 生成 CUDA kernel（forward + backward） | ✅ |
+| 编译失败自动 retry（最多 3 次，第 3 次降级） | ✅ |
+| ctypes 加载 .so，数值对比验证（相对误差 < 5%） | ✅ |
+| 注入 Qwen3-8B（SiLU × 36，RMSNorm × 145） | ✅ |
+| Alpaca 指令微调（LoRA），Loss 0.97 → 0.29 | ✅ |
+| 按 OperatorCategory 自动判断算子复杂度 | ✅ |
+| 新算子自动识别并写入 generated_ops.py | ✅ |
+| 验证通过的 kernel 持久化到 SQLite，下次直接复用 | ✅ |
+
+**当前限制：**
+- `flash_attention`、`fused_moe` 接口复杂，**暂不支持自动注入**，使用 PyTorch fallback
+- 端到端训练流程目前仅支持 CUDA 后端；AscendC/HIP 后端只生成+验证
 
 ---
 
 ## 快速开始
 
-### 安装
-
 ```bash
-git clone <repo_url> && cd operator_agent
+git clone https://github.com/hywei0211/operator_agent
+cd operator_agent
 pip install -r requirements.txt
 
-# 配置 LLM API
-cp .env.example .env
-# 编辑 .env，填入 QWEN_API_KEY（或 OPENAI_API_KEY / ANTHROPIC_AUTH_TOKEN）
+# 配置 Qwen API（DashScope）
+export QWEN_API_KEY=sk-xxxxxxxxxxxxxxxx
 ```
 
-### 用自然语言生成算子
+### 端到端训练（最简命令）
 
 ```bash
-# 自然语言（系统自动解析意图 + ReviewLoop 验证）
-python cli.py generate "帮我生成 SiLU 算子，目标昇腾 910B"
-python cli.py generate "Generate FlashAttention for H100"
+# Custom 模式：全 Agent 生成算子 + 注入 + LoRA 训练（三模式对比）
+python examples/full_agent_lora_train.py --llm qwen --mode all --steps 300
 
-# 指定参数
-python cli.py generate --op silu --gpu ascend_910b --backend ascendc --llm qwen
+# 快速冒烟（Mock LLM，不消耗 API，验证流程正确性）
+python examples/full_agent_lora_train.py --llm mock --mode custom --steps 5
+```
 
-# 快速生成（跳过 ReviewLoop 验证）
-python cli.py generate --op silu --gpu rtx_4090 --no-review
+### CLI 交互模式
 
-# 交互模式（推荐，支持多轮追问）
+```bash
+python cli.py generate "帮我生成一个 SiLU 算子，目标 RTX 4090"
+python cli.py generate --op rmsnorm --gpu rtx_4090 --backend cuda --llm qwen
+python cli.py registry list
 python cli.py interactive --llm qwen
 ```
 
-### NPU 测试
+### Slurm 集群
 
 ```bash
-python cli.py npu-test --llm qwen                    # 全部算子
-python cli.py npu-test --llm qwen --ops silu gelu     # 指定算子
-bash tests/hetero/run_phase1_npu.sh qwen               # Shell 脚本
-```
-
-### 算子仓库管理
-
-```bash
-python cli.py registry list                              # 列出所有算子
-python cli.py registry show silu ascend_910b             # 查看算子详情
-python cli.py registry stats                             # 仓库统计
-python cli.py registry history silu ascend_910b          # 版本历史
-python cli.py registry search --gpu h100_sxm5            # 搜索 H100 上的算子
-python cli.py registry search --backend cuda --min-bw 0.6  # 搜索高性能 CUDA 算子
-python cli.py registry export ./backup.json              # 导出仓库
-```
-
-### 知识库 & 缓存管理
-
-```bash
-python cli.py kb stats                                   # 编译错误知识库统计
-python cli.py kb export ./kb_share.json                  # 导出（可提交 git 分享）
-python cli.py kb import ./kb_from_teammate.json          # 导入
-python cli.py cache stats                                # LLM 缓存统计
-python cli.py cache clear                                # 清空缓存
-```
-
-### Python API
-
-```python
-import asyncio
-from main import run_operator_generation
-
-async def generate():
-    results = await run_operator_generation(
-        operator_request="FlashAttention v2 with BF16 support",
-        target_gpus=["h100_sxm5", "mi300x"],
-    )
-    if results["success"]:
-        for gpu, kernel in results["output"]["kernels"].items():
-            print(f"{gpu}: {kernel.backend} kernel, {len(kernel.source_code)} chars")
-
-asyncio.run(generate())
+MODE=full_agent LLM=qwen STEPS=300 MODEL=/path/to/Qwen3-8B \
+    sbatch scripts/slurm/run_lora_slurm.sh
 ```
 
 ---
 
-## 支持的硬件
-
-| 厂商 | 型号 | 编程后端 | 状态 |
-|------|------|---------|------|
-| NVIDIA | H100 SXM5 | CUDA | ✅ 已验证 |
-| NVIDIA | RTX 4090 | CUDA | ✅ 已验证 |
-| NVIDIA | A100 80GB | CUDA | ✅ |
-| NVIDIA | RTX 3090 | CUDA | ✅ |
-| AMD | MI300X | HIP | 框架已实现 |
-| AMD | MI250X | HIP | 框架已实现 |
-| Intel | Gaudi 3 | SYCL | 框架已实现 |
-| 华为 | 昇腾 910B | AscendC | ✅ 已验证 |
-| 华为 | 昇腾 910C | AscendC | 框架已实现 |
-
----
-
-## 验证体系 — 6 级硬件自适应
-
-系统自动检测当前硬件，能验多深就验多深：
-
-| Level | 名称 | 需要什么 | 验证了什么 |
-|-------|------|---------|-----------|
-| 1 | `static` | 无 | 代码结构、语法、关键 API 使用 |
-| 2 | `llm_review` | LLM API | 数学逻辑正确性（LLM 审查） |
-| 3 | `cpu_math` | PyTorch | forward + backward 数值对比（gradcheck） |
-| 4 | `compiled` | 匹配的编译器 | 真实编译通过 |
-| 5 | `hw_verified` | **匹配的 GPU** | 真实硬件运行 + 数值验证 |
-| 6 | `benchmarked` | **匹配的 GPU** | + 性能 benchmark |
+## 系统流程
 
 ```
-本地有 4090, 生成 CUDA 算子  → 验到 Level 6 (benchmarked)
-本地有 4090, 生成昇腾算子    → 验到 Level 3 (cpu_math)
-本地什么都没有               → 验到 Level 2 (llm_review)
-```
-
----
-
-## 测试结果
-
-### RTX 4090 (CUDA)
-
-```
-  ✅ rmsnorm           compile=✅  math=✅  speedup=1.00x
-  ✅ gelu              compile=✅  math=✅  speedup=1.00x
-  ✅ silu              compile=✅  math=✅  speedup=1.00x
-  ✅ flash_attention   compile=✅  math=✅  speedup=1.00x
-  ✅ matmul            compile=✅  math=✅  speedup=1.00x
-```
-
-### 昇腾 910B4 (AscendC)
-
-```
-  ✅ gelu              err=0.00e+00  time=41.9s  speedup=1.02x  (156 lines)
-  ✅ silu              err=0.00e+00  time=46.7s  speedup=1.00x  (193 lines)
-  ✅ rmsnorm           err=0.00e+00  time=49.8s  speedup=1.00x  (192 lines)
-  ✅ matmul            err=0.00e+00  time=34.6s  speedup=0.99x  (148 lines)
-  ✅ flash_attention   err=0.00e+00  time=94.7s  speedup=1.01x  (324 lines)
-```
-
-### Backward gradcheck (CPU)
-
-```
-  ✅ gelu_backward      gradcheck passed
-  ✅ silu_backward      gradcheck passed
-  ✅ softmax_backward   gradcheck passed
-  ✅ matmul_backward    gradcheck passed
-  ✅ rmsnorm_backward   gradcheck passed
+用户命令
+    │
+    ▼
+Step 0   TrainingAnalystAgent  静态分析，识别 silu/rmsnorm/matmul...
+    │
+    ▼
+Step 0b  AutoOpRegistrar       对比注册表，自动生成缺失算子的 OperatorDesc
+    │
+    ▼
+Step 0c  持久化缓存查询         SQLite 中已有验证通过的 kernel？→ 直接复用
+    │
+    ▼
+Step 1   CodeGenAgent          Qwen API 生成 CUDA kernel（forward + backward）
+         编译失败 → stderr 回传 LLM → 重试 ×3（第3次降级为简单版）
+    │
+    ▼
+Step 2   nvcc 编译              .cu → .so，失败时触发 PyTorch fallback
+    │
+    ▼
+Step 2.5 verify_all_kernels    ctypes 加载 → 随机输入 → 对比 PyTorch reference
+         通过 → 存入 SQLite；失败 → PyTorch fallback
+    │
+    ▼
+Step 3   patch_model           SiLU × 36 + RMSNorm × 145 注入模型
+    │
+    ▼
+Step 4-5 LoRA 训练 + 评估      Alpaca 指令微调，三模式对比
 ```
 
 ---
@@ -202,171 +103,156 @@ asyncio.run(generate())
 
 ```
 operator_agent/
-├── agents/                 # 14 个专业 Agent（核心逻辑）
-│   ├── base_agent.py       #   基类（LLM 重试、状态管理、消息通信）
-│   ├── orchestrator.py     #   V1 编排器（串行流水线）
-│   ├── intent_parser.py    #   意图解析（自然语言→结构化请求）
-│   ├── training_analyst.py #   训练代码分析（提取算子依赖）
-│   ├── hardware_profiler.py#   硬件分析（GPU 规格查询）
-│   ├── gpu_discovery.py    #   未知 GPU 发现（瀑布式查询）
-│   ├── sdk_resolver.py     #   SDK 选择（CUDA/HIP/AscendC）
-│   ├── spec_analyzer.py    #   算子规格解析（→ OperatorIR）
-│   ├── tiling_agent.py     #   分块策略计算
-│   ├── code_generator.py   #   代码生成（forward + backward）
-│   ├── optimizer.py        #   Roofline 性能优化
-│   ├── verifier.py         #   6 级硬件自适应验证
-│   ├── review_loop.py      #   5 阶段质量保障循环（含断点续传+进度回调）
-│   ├── distribution.py     #   异构集群分布式部署
-│   ├── training_executor.py#   算子注入训练（autograd 包装生成）
-│   └── runtime_monitor.py  #   GPU 运行时监控
 │
-├── orchestrator_v2.py      # V2 主调度器（双路径编排 + 并行生成）
-├── models/                 # 核心数据模型
-│   ├── hardware_model.py   #   GPUSpec / MemorySpec / ComputeSpec
-│   └── operator_ir.py      #   OperatorIR（含 backward）/ GeneratedKernel
+├── cli.py                          # CLI 入口（generate/registry/kb/cache/interactive）
+├── main.py                         # Python API 入口
+├── train.py                        # 训练主入口
+├── orchestrator_v2.py              # 双路径编排器
 │
-├── knowledge_base/         # 知识库
-│   ├── hardware_specs/     #   10+ GPU 完整规格数据库 + 昇腾 AI Core 规格
-│   └── compile_error_kb.py #   编译错误知识库（37 条规则 + 自动学习 + 导入导出）
+├── examples/
+│   ├── full_agent_lora_train.py    # 主流程入口（Step 0→5，三模式对比）
+│   └── qwen_lora_train.py          # 早期版本（SiLU only，兼容保留）
 │
-├── operators/registry.py   # SQLite 算子仓库（版本管理 + 验证等级 + Few-shot）
-├── mcp_servers/            # 4 个 MCP 工具服务器
-│   ├── gpu_spec_server.py  #   GPU 规格查询
-│   ├── sdk_docs_server.py  #   SDK 文档
-│   ├── operator_registry_server.py  # 算子仓库 MCP 接口
-│   └── remote_executor_server.py    # 远程编译/测试/Benchmark
+├── operators/                      # 通用算子子系统（核心）
+│   ├── op_desc.py                  # OperatorDesc dataclass
+│   ├── op_registry.py              # OpRegistry 运行时注册中心 + 全局单例
+│   ├── verify.py                   # 通用 verify_kernel（ctypes 数值验证）
+│   ├── patch.py                    # 通用 patch_model（4 种注入模式）
+│   ├── builtin_ops.py              # 内置算子（silu/rmsnorm/gelu/matmul 等）
+│   ├── auto_registrar.py           # 自动识别新算子，生成 OperatorDesc
+│   ├── generated_ops.py            # AutoOpRegistrar 写入（运行时生成）
+│   └── registry.py                 # SQLite 持久化存储（OperatorEntry）
 │
-├── prompts/code_gen_prompts.py  # 代码生成 Prompt（forward + backward + 3 后端）
+├── agents/
+│   ├── training_analyst.py         # 训练代码静态分析
+│   ├── spec_analyzer.py            # OperatorIR 生成 + OPERATOR_TEMPLATES
+│   ├── code_generator.py           # CUDA/HIP/AscendC kernel 生成 + retry
+│   ├── verifier.py                 # 6 级硬件自适应验证
+│   ├── review_loop.py              # 5 阶段质量循环
+│   └── ...
+│
+├── knowledge_base/
+│   ├── hardware_specs/gpu_database.py   # 10 款 GPU 规格数据库
+│   └── compile_error_kb.py              # 37 条编译错误自动 patch 规则
+│
+├── models/
+│   ├── operator_ir.py              # OperatorIR / OperatorCategory
+│   └── hardware_model.py           # GPUSpec / GPUBackend
+│
 ├── tools/
-│   ├── llm_client.py       #   LLM 客户端（Qwen/OpenAI/Claude/Mock + 响应缓存）
-│   ├── cpu_simulator.py    #   CPU 模拟器（20+ 算子参考实现 + backward gradcheck）
-│   └── model_router.py     #   多模型路由（简单/复杂算子分流）
+│   ├── llm_client.py               # LLM 客户端（Qwen/OpenAI/Mock + 缓存）
+│   └── cpu_simulator.py            # CPU reference（20+ 算子）
 │
-├── tests/                  # 测试
-│   ├── unit/               #   单元测试
-│   ├── simulation/         #   无 GPU 完整模拟测试
-│   └── hetero/             #   异构 GPU 真机测试（CUDA + NPU）
+├── prompts/
+│   └── code_gen_prompts.py         # Prompt 模板（CUDA/HIP/AscendC/backward）
 │
-├── config/config.yaml      # 全局配置
-├── cli.py                  # CLI 入口（generate + registry + kb + cache + interactive）
-├── main.py                 # Python API 入口
-├── train.py                # V2 训练入口（完整 pipeline）
-└── .env                    # API 密钥
+├── scripts/
+│   ├── slurm/run_lora_slurm.sh     # Slurm 训练提交脚本
+│   ├── tests/test_*.sh             # 算子调试测试脚本（16 个）
+│   └── tools/test_qwen.py          # API 连通性测试
+│
+├── docs/
+│   ├── EXAMPLES.md                 # 真实运行示例（含日志）★ 建议先读
+│   ├── ARCHITECTURE.md             # 系统架构详解
+│   ├── TRAINING.md                 # 端到端训练流程详解
+│   ├── OPERATORS.md                # 算子子系统详解
+│   ├── WORKFLOW.md                 # 工作流最佳实践
+│   └── CLI_REFERENCE.md            # CLI 完整参考手册
+│
+├── .compile_errors.json            # 编译错误知识库（37 条规则）
+└── requirements.txt
 ```
-
-**详细文档：**
-
-- [系统架构 & 所有组件详解](docs/ARCHITECTURE.md)
-- [Agent 完整工作流程](docs/WORKFLOW.md)
 
 ---
 
-## 反向传播支持
+## 支持的算子
 
-系统为全部 7 个核心算子生成 backward kernel，支持训练中的梯度计算：
+| 算子 | Forward | Backward | 模型注入 |
+|------|---------|----------|---------|
+| silu | ✅ | ✅ float32 输出 | act_fn 替换 |
+| rmsnorm | ✅ | ✅ float32 输出 | 模块替换 |
+| gelu | ✅ | ✅ float32 输出 | act_fn 替换 |
+| matmul | ✅ | — | nn.Linear 替换 |
+| softmax | ✅ 验证 | — | — |
+| cross_entropy | ✅ 验证 | — | — |
+| embedding | ✅ 验证 | — | — |
 
-| 算子 | forward | backward | saved_for_backward | gradcheck |
-|------|---------|----------|-------------------|-----------|
-| gelu | `x*0.5*(1+tanh(...))` | `grad_y * (cdf + x*pdf)` | [x] | ✅ |
-| silu | `x*sigmoid(x)` | `grad_y * sig*(1+x*(1-sig))` | [x] | ✅ |
-| softmax | `exp(x)/sum(exp(x))` | `y*(grad_y - dot(grad_y,y))` | [y] | ✅ |
-| rmsnorm | `x/rms * weight` | chain rule + reduce | [x, weight] | ✅ |
-| matmul | `A @ B` | `grad_C@B^T, A^T@grad_C` | [A, B] | ✅ |
-| flash_attention | `softmax(QK^T/√d)@V` | recompute P + 3 matmul | [Q, K, V] | ✅ |
-| fused_moe | `sum(gate*expert(x))` | routed expert gradients | [h, g, w1, w2] | ✅ |
+**AutoOpRegistrar 支持按 OperatorCategory 自动推导接口：**
 
-自动生成 `torch.autograd.Function` 包装，可作为 `F.silu(x)` 的 drop-in 替换：
+| OperatorCategory | 自动生成 | ctypes 接口 |
+|-----------------|---------|------------|
+| ELEMENTWISE | ✅ | `(x*, out*, N)` |
+| NORMALIZATION | ✅ | `(x*, w*, out*, N, H, eps)` |
+| MATMUL | ✅ | `(A*, B*, C*, M, N, K)` |
+| REDUCTION | ✅ | `(x*, out*, N, C)` |
+| EMBEDDING | ✅ | `(weight*, idx*, out*, V, H)` |
+| ATTENTION / FUSED | ⚠️ 手动实现 | — |
+
+---
+
+## 支持的硬件
+
+| 型号 | Key | 后端 | 端到端训练 |
+|------|-----|------|----------|
+| RTX 4090 | `rtx_4090` | CUDA | ✅ 默认 |
+| H100 SXM5 / PCIe | `h100_sxm5` | CUDA | ✅ |
+| A100 80GB | `a100_80gb` | CUDA | ✅ |
+| RTX 3090 | `rtx_3090` | CUDA | ✅ |
+| MI300X / MI250X | `mi300x` | HIP | 框架已实现 |
+| 昇腾 910B / 910C | `ascend_910b` | AscendC | 生成+验证 |
+
+---
+
+## 测试结果（Qwen3-8B，RTX 4090，300 steps）
+
+```
+算子覆盖:
+  silu_forward    ✅ Agent kernel  rel_err=0.0012
+  silu_backward   ✅ Agent kernel  rel_err=0.0000
+  rmsnorm_forward ✅ Agent kernel  rel_err=0.0009
+  rmsnorm_backward ⚠ PyTorch fallback
+
+Loss: 0.97 → 0.29（下降 70%）
+
+指令跟随评估（5 道测试题）:
+  Custom  (Agent 算子):    95.0%  KW: 90%  Fmt: 100%
+  Baseline (PyTorch):      92.5%  KW: 85%  Fmt: 100%
+  No-finetune (基座):      93.5%  KW: 87%  Fmt: 100%
+
+Custom vs Baseline: +2.5% → 验证 Agent 算子数值等价于 PyTorch
+```
+
+---
+
+## 添加新算子
 
 ```python
-# 系统自动生成的代码
-output = silu_custom(x)        # forward 用自定义 kernel
-loss.backward()                # backward 自动调用生成的 backward kernel
+# 方式一：AutoOpRegistrar 自动生成（适合 elementwise/norm/matmul）
+from operators.auto_registrar import AutoOpRegistrar
+auto_reg = AutoOpRegistrar()
+print(auto_reg.explain_complexity("hardswish"))
+# → "hardswish: 逐元素算子（简单）— ctypes: (x, out, N)"
+desc = auto_reg.generate_op_desc("hardswish")
+auto_reg.write_and_register([desc], get_op_registry())
+
+# 方式二：手工定义（适合 forward+backward+注入完整实现）
+# 参见 operators/builtin_ops.py 中的 silu/rmsnorm 实现作为模板
 ```
 
 ---
 
-## 配置
+## 详细文档
 
-### .env 文件
-
-```bash
-# Qwen（推荐，阿里云 DashScope）
-QWEN_API_KEY=sk-xxx
-QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-QWEN_MODEL=qwen3-235b-a22b
-
-# 或 OpenAI
-OPENAI_API_KEY=sk-xxx
-
-# 或 Anthropic
-ANTHROPIC_AUTH_TOKEN=sk-xxx
-```
-
-### config/config.yaml
-
-```yaml
-llm:
-  backend: "qwen"                    # qwen / openai / anthropic / mock
-  model: "qwen3-235b-a22b"
-  temperature: 0.1
-  enable_thinking: false             # Qwen3 思考模式
-
-optimizer:
-  max_iterations: 3
-  target_efficiency: 0.75
-
-workflow:
-  max_retry_on_failure: 2
-  parallel_codegen: true
-```
-
----
-
-## 扩展指南
-
-### 添加新 GPU
-
-```python
-# knowledge_base/hardware_specs/gpu_database.py
-MY_GPU = GPUSpec(model_name="My GPU", vendor=GPUVendor.NVIDIA, ...)
-GPU_DATABASE["my_gpu"] = MY_GPU
-```
-
-### 添加新算子模板（含 backward）
-
-```python
-# agents/spec_analyzer.py
-OPERATOR_TEMPLATES["my_operator"] = {
-    "category": OperatorCategory.ELEMENTWISE,
-    "math_description": "y = f(x)",
-    "reference_impl": "return F.my_op(x)",
-    "backward_math_description": "grad_x = grad_y * f'(x)",
-    "backward_reference_impl": "return grad_output * f_prime(x)",
-    "saved_for_backward": ["x"],
-}
-```
-
-### 分享编译错误经验
-
-```bash
-# 导出本机积累的编译错误经验
-python cli.py kb export ./my_errors.json
-
-# 团队成员导入
-python cli.py kb import ./my_errors.json
-```
-
----
-
-## 技术栈
-
-| 类别 | 技术 |
+| 文档 | 内容 |
 |------|------|
-| LLM | Qwen3 / GPT-4 / Claude（+ SQLite 响应缓存） |
-| 存储 | SQLite（算子仓库 + 编译错误 KB + LLM 缓存） |
-| 框架 | Python asyncio（异步多 Agent 协作） |
-| GPU 工具链 | CUDA / ROCm / CANN (AscendC) / Triton |
-| 梯度验证 | torch.autograd.gradcheck（有限差分法） |
-| NPU 验证 | torch_npu + CANN 8.3.RC1 |
-| CLI | Click |
-| 测试 | pytest + 自定义 NPU 测试框架 |
+| [EXAMPLES.md](docs/EXAMPLES.md) | 真实运行示例（含完整日志）**建议先读** |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 四层架构图、核心数据流 |
+| [TRAINING.md](docs/TRAINING.md) | Step 0→5 逐步图解、实测数据 |
+| [OPERATORS.md](docs/OPERATORS.md) | OperatorDesc 字段、添加算子步骤 |
+| [CLI_REFERENCE.md](docs/CLI_REFERENCE.md) | CLI 完整参考手册 |
+
+---
+
+## License
+
+MIT

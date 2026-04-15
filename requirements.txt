@@ -19,6 +19,10 @@ dataclasses-json>=0.6.7
 # triton>=3.0.0                 # OpenAI Triton（跨平台内核）
 # cupy-cuda12x>=13.0.0          # CuPy（CUDA Python绑定）
 
+# LoRA 训练
+transformers>=4.40.0            # Hugging Face Transformers
+peft>=0.11.0                    # Parameter-Efficient Fine-Tuning (LoRA)
+
 # 测试
 pytest>=8.2.0
 pytest-asyncio>=0.23.0
