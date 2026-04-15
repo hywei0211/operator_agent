@@ -48,7 +48,7 @@ OpRegistry (10 entries, 7 ops):
 
 ---
 
-### Step 0b：自动识别未注册算子
+### Step 0：自动识别未注册算子
 
 `TrainingAnalystAgent` 静态分析模型名称，识别出训练所需的全部算子；`AutoOpRegistrar` 对比注册表，找出差集：
 
