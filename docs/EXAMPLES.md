@@ -53,14 +53,14 @@ OpRegistry (10 entries, 7 ops):
 `TrainingAnalystAgent` 静态分析模型名称，识别出训练所需的全部算子；`AutoOpRegistrar` 对比注册表，找出差集：
 
 ```
-[Step 0b] 发现未注册算子: ['flash_attention', 'matmul']
+[Step 0] 发现未注册算子: ['flash_attention', 'matmul']
 
 [AutoOpRegistrar] 算子复杂度分析:
   flash_attention: 复杂算子（无法自动推导）— 接口依赖运行时参数（head_dim/batch等），需手动实现
   matmul: 矩阵乘法（中等）— 两输入一输出，ctypes: (A, B, C, M, N, K)
 
-[Step 0b] 已自动注册 1 个新算子并写入 generated_ops.py
-[Step 0b] 以下算子接口复杂，暂用 PyTorch fallback: ['flash_attention']
+[Step 0] 已自动注册 1 个新算子并写入 generated_ops.py
+[Step 0] 以下算子接口复杂，暂用 PyTorch fallback: ['flash_attention']
 ```
 
 **matmul** 被自动生成 `OperatorDesc` 并写入 `operators/generated_ops.py`：
